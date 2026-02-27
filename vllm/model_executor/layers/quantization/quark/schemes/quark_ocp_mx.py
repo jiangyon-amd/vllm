@@ -37,7 +37,71 @@ from vllm.platforms import current_platform
 
 from .quark_scheme import QuarkScheme
 
+# Fused rotation + MXFP4 quantization kernel — registered as custom op
+_has_fused_triton_rot_quant = False
+try:
+    from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon import (
+        fused_rotation_quant as _fused_rot_quant_kernel,
+    )
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _fused_rot_quant_op(
+        x: torch.Tensor,
+        rotation: torch.Tensor,
+        rotation_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_2d = x.reshape(-1, x.shape[-1])
+        M, K = x_2d.shape
+        sn_padded = (K // 32 + 7) // 8 * 8
+        sm_padded = (M + 255) // 256 * 256
+        fp4 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+        sc = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
+        if M < 32:
+            sc_raw = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
+            fp4, sc_raw = _fused_rot_quant_kernel(x_2d, rotation, rotation_size,
+                                                fp4_out=fp4, scales_out=sc_raw, shuffle_scales=False)
+            sc[:M, :K//32] = sc_raw
+        else:
+            sc.zero_()
+            fp4, sc = _fused_rot_quant_kernel(x_2d, rotation, rotation_size,
+                                            fp4_out=fp4, scales_out=sc, shuffle_scales=True)
+        return fp4, sc
+
+    def _fused_rot_quant_fake(
+        x: torch.Tensor,
+        rotation: torch.Tensor,
+        rotation_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M = x.reshape(-1, x.shape[-1]).shape[0]
+        K = x.shape[-1]
+        # Always return padded shape for CUDAGraph compatibility
+        sn_padded = (K // 32 + 7) // 8 * 8
+        sm_padded = (M + 255) // 256 * 256
+        return (
+            torch.empty((M, K // 2), dtype=torch.uint8, device=x.device),
+            torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device),
+        )
+
+    direct_register_custom_op(
+        op_name="fused_rotation_quant",
+        op_func=_fused_rot_quant_op,
+        mutates_args=[],
+        fake_impl=_fused_rot_quant_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+    def _fused_rot_quant(x, rotation, rotation_size=128, **kwargs):
+        return torch.ops.vllm.fused_rotation_quant(x, rotation, rotation_size)
+
+
+
+    _has_fused_triton_rot_quant = True
+    print("[INFO] Registered fused_rotation_quant as custom op (CUDAGraph compatible)")
+except ImportError:
+    pass
+
 logger = init_logger(__name__)
+
 
 
 # TODO: move registration of custom op to aiter_ops.py
@@ -76,10 +140,33 @@ try:
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
         x_scales: torch.Tensor | None = None,
+        rotation: torch.Tensor | None = None,
+        rotation_size: int = 0,
     ) -> torch.Tensor:
         M = x.shape[0]
         N = weight.shape[0]
         K = weight.shape[1]
+        # Fused rotation+quant if rotation provided
+        if rotation is not None and rotation_size > 0 and _has_fused_triton_rot_quant:
+            x_2d = x.reshape(-1, x.shape[-1])
+            if M > 32:
+                # Fused shuffle for large M (prefill)
+                sn_pad = (x.shape[-1] // 32 + 7) // 8 * 8
+                sm_pad = (M + 255) // 256 * 256
+                fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.zeros((sm_pad, sn_pad), dtype=torch.uint8, device=x.device)
+                x_q, x_s = _fused_rot_quant_kernel(x_2d, rotation, rotation_size,
+                                                  fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=True)
+            else:
+                # No shuffle, no padding — fast decode path
+                fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.empty((M, x.shape[-1] // 32), dtype=torch.uint8, device=x.device)
+                x_q, x_s = _fused_rot_quant_kernel(x_2d, rotation, rotation_size,
+                                                   fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=False)
+            x_q = x_q.view(torch.float4_e2m1fn_x2)
+            x_s = x_s.view(torch.float8_e8m0fnu)
+            x_scales = x_s
+            x = x_q
         if rocm_use_aiter_fp4_asm_gemm:
             if M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
                 if x_scales is None:
@@ -125,8 +212,10 @@ try:
                     dtype=out_dtype,
                 )
 
+                w = weight.view(torch.float4_e2m1fn_x2) if weight.dtype == torch.uint8 else weight
+                ws = weight_scale.view(torch.float8_e8m0fnu) if weight_scale.dtype == torch.uint8 else weight_scale
                 gemm_a4w4(
-                    x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
+                    x_q, w, x_s, ws.view(x_s.dtype), y, bpreshuffle=True
                 )
             return y[:M]
         else:
@@ -146,9 +235,11 @@ try:
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        x_scales: torch.Tensor = None,
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
+        x_scales: torch.Tensor | None = None,
+        rotation: torch.Tensor | None = None,
+        rotation_size: int = 0,
     ) -> torch.Tensor:
         return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -190,6 +281,8 @@ class QuarkOCP_MX(QuarkScheme):
         ) = OrthogonalTransform.setup_transform(
             quant_config=quant_config, layer_names=layer_names
         )
+        if self.use_online_rotation:
+            import sys; print(f"[ROTATION DEBUG] layer_names={layer_names} -> rotation ENABLED, size={self.rotation_size}", file=sys.stderr, flush=True)
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -228,6 +321,15 @@ class QuarkOCP_MX(QuarkScheme):
         )
 
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
+
+        # Fused rotation+quant: use Triton kernel when available
+        self.use_fused_rotation_quant = (
+            self.use_online_rotation
+            and _has_fused_triton_rot_quant
+            and not self.emulate
+        )
+        if self.use_fused_rotation_quant:
+            logger.info("Using fused Triton rotation+MXFP4 quant kernel")
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
             # Currently need these kernels if not emulating
@@ -372,18 +474,29 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_online_rotation:
+        if self.use_online_rotation and not self.use_fused_rotation_quant:
+            # Separated path: rotation matmul, then quant+gemm below
             x = self.input_transform(x)
 
         if self.emulate:
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
-        else:
-            return torch.ops.vllm.gemm_with_dynamic_quant(
-                x,
-                layer.weight,
-                layer.weight_scale,
-                self.rocm_use_aiter_fp4_asm_gemm,
-                self.out_dtype,
-            )
+
+        # Fused path passes rotation into gemm_with_dynamic_quant;
+        # separated/RTN path passes rotation=None (already rotated or no rotation)
+        rotation = None
+        rotation_size = 0
+        if self.use_fused_rotation_quant:
+            rotation = self.input_transform.input_rotation.data
+            rotation_size = self.rotation_size
+
+        return torch.ops.vllm.gemm_with_dynamic_quant(
+            x,
+            layer.weight,
+            layer.weight_scale,
+            self.rocm_use_aiter_fp4_asm_gemm,
+            self.out_dtype,
+            rotation=rotation,
+            rotation_size=rotation_size,
+        )
