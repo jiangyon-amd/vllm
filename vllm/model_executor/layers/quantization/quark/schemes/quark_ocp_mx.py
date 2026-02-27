@@ -435,32 +435,25 @@ class QuarkOCP_MX(QuarkScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_fused_rotation_quant:
+            # Fused path: rotation + quant in single kernel for ALL M
             x_2d = x.reshape(-1, x.shape[-1])
+            rotation = self.input_transform.input_rotation.data
+            x_q, x_s = _fused_rot_quant(x_2d, rotation, self.rotation_size)
+            x_q = x_q.view(torch.float4_e2m1fn_x2)
             M = x_2d.shape[0]
-            if M < 32:
-                # Fused path: rotation + quant in single kernel (decode)
-                rotation = self.input_transform.input_rotation.data
-                x_q, x_s = _fused_rot_quant(x_2d, rotation, self.rotation_size)
-                x_q = x_q.view(torch.float4_e2m1fn_x2)
-                x_s = x_s.view(torch.float8_e8m0fnu)
-                return torch.ops.vllm.gemm_with_dynamic_quant(
-                    x_q,
-                    layer.weight,
-                    layer.weight_scale,
-                    self.rocm_use_aiter_fp4_asm_gemm,
-                    self.out_dtype,
-                    x_scales=x_s,
-                )
-            else:
-                # Large M (prefill): use separated path for scale compatibility
-                x = self.input_transform(x)
-                return torch.ops.vllm.gemm_with_dynamic_quant(
-                    x,
-                    layer.weight,
-                    layer.weight_scale,
-                    self.rocm_use_aiter_fp4_asm_gemm,
-                    self.out_dtype,
-                )
+            if M >= 32:
+                # Apply scale shuffle for GEMM compatibility
+                from aiter.utility.fp4_utils import e8m0_shuffle
+                x_s = e8m0_shuffle(x_s)
+            x_s = x_s.view(torch.float8_e8m0fnu)
+            return torch.ops.vllm.gemm_with_dynamic_quant(
+                x_q,
+                layer.weight,
+                layer.weight_scale,
+                self.rocm_use_aiter_fp4_asm_gemm,
+                self.out_dtype,
+                x_scales=x_s,
+            )
         elif self.use_online_rotation:
             # Separated path: rotation matmul + separate quant
             x = self.input_transform(x)
