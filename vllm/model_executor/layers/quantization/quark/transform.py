@@ -86,5 +86,11 @@ def rotation_weight_loader(
     expert_id: int | None = None,
 ):
     assert param.shape == loaded_weight.shape
-    assert param.dtype == loaded_weight.dtype
+    # Handle dtype conversion: Quark may export bool, vLLM expects int8/float64
+    if param.dtype != loaded_weight.dtype:
+        # Convert bool to int8 for Hadamard (True->1, False->-1 pattern)
+        if loaded_weight.dtype == torch.bool and param.dtype == torch.int8:
+            loaded_weight = loaded_weight.to(torch.int8) * 2 - 1  # True->1, False->-1
+        else:
+            loaded_weight = loaded_weight.to(param.dtype)
     param.data.copy_(loaded_weight)

@@ -118,6 +118,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
+    VLLM_ROCM_USE_FUSED_ROTATION_QUANT: bool = False
+    VLLM_ROCM_USE_GLUON_ROTATION_QUANT: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
@@ -983,6 +985,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
+    ),
+    # Whether to use fused rotation + MXFP4 quantization kernel.
+    # Requires VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1.
+    # By default is disabled.
+    "VLLM_ROCM_USE_FUSED_ROTATION_QUANT": lambda: (
+        os.getenv("VLLM_ROCM_USE_FUSED_ROTATION_QUANT", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_GLUON_ROTATION_QUANT": lambda: (
+        os.getenv("VLLM_ROCM_USE_GLUON_ROTATION_QUANT", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter rope.
     # By default is disabled.

@@ -78,7 +78,15 @@ class SiluAndMul(CustomOp):
     def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.silu_and_mul
+            try:
+                self.op = torch.ops._C.silu_and_mul
+            except AttributeError:
+                # Fallback to AITER or native if _C extension not available
+                try:
+                    from aiter import silu_and_mul as _aiter_silu
+                    self.op = _aiter_silu
+                except ImportError:
+                    self._forward_method = self.forward_native
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 
@@ -227,10 +235,13 @@ class GeluAndMul(CustomOp):
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unknown approximate mode: {approximate}")
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            if approximate == "none":
-                self.op = torch.ops._C.gelu_and_mul
-            elif approximate == "tanh":
-                self.op = torch.ops._C.gelu_tanh_and_mul
+            try:
+                if approximate == "none":
+                    self.op = torch.ops._C.gelu_and_mul
+                elif approximate == "tanh":
+                    self.op = torch.ops._C.gelu_tanh_and_mul
+            except AttributeError:
+                self._forward_method = self.forward_native
         if current_platform.is_rocm() and approximate == "tanh":
             logger.warning_once(
                 "[ROCm] PyTorch's native GELU with tanh approximation is unstable "
