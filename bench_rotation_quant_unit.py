@@ -6,9 +6,12 @@ Compares three implementations (precision-aligned to HIP quant):
   2. Triton v5: fused rotation + quant (standard Triton, hw FP4 instruction)
   3. Gluon v13: fused rotation + quant (Gluon, hw FP4 instruction, MFMA layout)
 """
-import sys
+import sys, os
 sys.path.insert(0, '/opt/aiter')
 sys.path.insert(0, '/data/jiangyon/vllm_rotation')
+sys.path.insert(0, '/data/jiangyon/vllm_rotation/hip_rotation_quant')
+os.environ.setdefault('LD_LIBRARY_PATH',
+    '/usr/local/lib/python3.10/dist-packages/torch/lib:' + os.environ.get('LD_LIBRARY_PATH', ''))
 
 import torch
 import time
@@ -19,10 +22,22 @@ WARMUP = 500
 N_ITER = 5000
 
 # ============================================================
-# Implementation 1a: Baseline — torch rotation + aiter triton quant
+# Implementation 1: Baseline — torch rotation + HIP C++ fused quant
+# ============================================================
+import rotation_quant_hip
+
+def baseline_hip_fused(x, rotation, rotation_size=128):
+    """HIP C++ fused rotation + quant kernel (the actual HIP baseline)."""
+    M, K = x.shape
+    fp4 = torch.empty(M, K // 2, dtype=torch.uint8, device=x.device)
+    sc = torch.empty(M, K // 32, dtype=torch.uint8, device=x.device)
+    rotation_quant_hip.fused_rotation_quant_hip(fp4, sc, x, rotation, rotation_size)
+    return fp4, sc
+
+# ============================================================
+# Implementation 1b: Baseline — torch rotation + aiter triton quant (2-step)
 # ============================================================
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
-from aiter.ops.quant import per_1x32_f4_quant_triton
 
 def baseline_torch_aiter(x, rotation, rotation_size=128):
     """Two-step: torch bf16 matmul + aiter triton MXFP4 quant (dynamic_mxfp4_quant)."""
@@ -34,24 +49,10 @@ def baseline_torch_aiter(x, rotation, rotation_size=128):
     return fp4, scales
 
 # ============================================================
-# Implementation 1b: Baseline — torch rotation + HIP-compat triton quant
-# ============================================================
-def baseline_torch_hip_triton(x, rotation, rotation_size=128):
-    """Two-step: torch bf16 matmul + per_1x32_f4_quant_triton (HIP-compatible)."""
-    M, K = x.shape
-    x_r = x.reshape(M, K // rotation_size, rotation_size)
-    x_rotated = torch.bmm(x_r, rotation.unsqueeze(0).expand(x_r.shape[0], -1, -1))
-    x_rotated = x_rotated.reshape(M, K)
-    fp4, scales = per_1x32_f4_quant_triton(x_rotated)
-    return fp4.view(torch.uint8), scales.view(torch.uint8)[:M]
-
-# ============================================================
 # Implementation 2: Triton v5 (fused, standard Triton)
 # ============================================================
-# v5 needs _mxfp4_quant_op, patch the import
-import aiter.ops.triton._triton_kernels.quant as _quant_pkg
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
-_quant_pkg._mxfp4_quant_op = _mxfp4_quant_op
+# v5 needs _mxfp4_quant_op — it's directly in the quant module (not a sub-package)
+from aiter.ops.triton._triton_kernels.quant import _mxfp4_quant_op
 
 from fused_rotation_mxfp4_quant_v5 import fused_rotation_mxfp4_quant as triton_v5
 
@@ -89,8 +90,8 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"Rotation size: {RS}, Warmup: {WARMUP}, Iterations: {N_ITER}")
     print(f"Implementations:")
-    print(f"  1a. Base-aiter:  torch.bmm + dynamic_mxfp4_quant (2-step)")
-    print(f"  1b. Base-HIP:    torch.bmm + per_1x32_f4_quant_triton (2-step, HIP-compat)")
+    print(f"  1.  HIP-fused:   HIP C++ fused rotation+quant kernel")
+    print(f"  1b. Base-aiter:  torch.bmm + dynamic_mxfp4_quant (2-step)")
     print(f"  2.  Triton v5:   fused kernel (standard Triton, hw FP4)")
     print(f"  3.  Gluon v13:   fused kernel (Gluon, hw FP4, MFMA layout quant)")
     print(f"  4.  Gluon v13p:  same as 3 with pre-allocated output")
@@ -113,7 +114,7 @@ def main():
         (128, 27648),
     ]
 
-    header = (f"{'Shape':>14s}  {'Base-aiter':>10s}  {'Base-HIP':>10s}  "
+    header = (f"{'Shape':>14s}  {'HIP-fused':>10s}  {'Base-aiter':>10s}  "
               f"{'Triton_v5':>10s}  {'Gluon_v13':>10s}  {'Gluon_pre':>10s}  "
               f"{'v5/hip':>7s}  {'glu/hip':>7s}  {'pre/hip':>7s}")
     print(header)
@@ -128,19 +129,19 @@ def main():
         sc_buf = torch.empty((M, K // 32), dtype=torch.uint8, device=device)
 
         # Benchmark each
+        t_hip = bench_fn(baseline_hip_fused, x, rot, RS, label="hip-fused")
         t_aiter = bench_fn(baseline_torch_aiter, x, rot, RS, label="base-aiter")
-        t_hip = bench_fn(baseline_torch_hip_triton, x, rot, RS, label="base-hip")
         t_v5 = bench_fn(triton_v5, x, rot, RS, label="triton_v5")
         t_gluon = bench_fn(gluon_v13, x, rot, RS, label="gluon_v13")
         t_gluon_pre = bench_fn(gluon_v13, x, rot, RS,
                                 fp4_buf=fp4_buf, sc_buf=sc_buf, label="gluon_pre")
 
-        # Speedup vs HIP baseline
+        # Speedup vs HIP fused baseline
         sp_v5 = t_hip / t_v5 if t_v5 > 0 else 0
         sp_glu = t_hip / t_gluon if t_gluon > 0 else 0
         sp_pre = t_hip / t_gluon_pre if t_gluon_pre > 0 else 0
 
-        print(f"  {M:>4d}x{K:<5d}  {t_aiter:>8.1f}us  {t_hip:>8.1f}us  "
+        print(f"  {M:>4d}x{K:<5d}  {t_hip:>8.1f}us  {t_aiter:>8.1f}us  "
               f"{t_v5:>8.1f}us  {t_gluon:>8.1f}us  {t_gluon_pre:>8.1f}us  "
               f"{sp_v5:>6.2f}x  {sp_glu:>6.2f}x  {sp_pre:>6.2f}x")
 
@@ -153,12 +154,12 @@ def main():
     torch.manual_seed(42)
     x = torch.randn(64, 5120, dtype=torch.bfloat16, device=device)
 
-    fp4_hip, sc_hip = baseline_torch_hip_triton(x, rot_I, RS)
+    fp4_hip, sc_hip = baseline_hip_fused(x, rot_I, RS)
     fp4_aiter, sc_aiter = baseline_torch_aiter(x, rot_I, RS)
     fp4_v5, sc_v5 = triton_v5(x, rot_I, RS)
     fp4_glu, sc_glu = gluon_v13(x, rot_I, RS)
 
-    print("  vs HIP baseline (per_1x32_f4_quant_triton):")
+    print("  vs HIP C++ fused kernel (rotation_quant_hip):")
     for name, fp4, sc in [("aiter_quant", fp4_aiter, sc_aiter),
                            ("triton_v5", fp4_v5, sc_v5),
                            ("gluon_v13", fp4_glu, sc_glu)]:
