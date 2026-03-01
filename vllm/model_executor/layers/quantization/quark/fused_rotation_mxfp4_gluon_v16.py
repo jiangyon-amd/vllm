@@ -134,10 +134,8 @@ def _fused_rot_quant_unified(
 
     if SHUFFLE_SCALES:
         # Fused e8m0_shuffle store
-        # For rows beyond M, zero out scales so padding has correct values
-        sc_m_valid = m_base + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store))
-        sc_s = gl.where(sc_m_valid[:, None] < M, sc_s, gl.zeros_like(sc_s))
-
+        # No explicit zero-padding needed: input x is masked (0 for rows >= M),
+        # so amax=0 → e8m0=0 naturally for padding rows
         sc_m_local = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store))
         sc_q = gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store))
         i1 = sc_m_local // 16
