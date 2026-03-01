@@ -84,6 +84,8 @@ def _fused_rot_quant_v13(
     acc = gl.zeros((BLOCK_M, RS), gl.float32, layout=mfma_layout)
     acc = gl.amd.cdna4.mfma(gl.convert_layout(x_tile, dot_a),
                              smem_rot.load(layout=dot_b), acc)
+    # Truncate to bf16 precision to match torch matmul (prevent decode drift)
+    acc = acc.to(gl.bfloat16).to(gl.float32)
 
     # ======== Quantization DIRECTLY in MFMA layout ========
     # acc is [BLOCK_M, RS] in mfma_layout
@@ -99,7 +101,7 @@ def _fused_rot_quant_v13(
 
     # Direct exponent extraction (round-up to match HIP fp4_scale carry logic)
     amax_u32 = amax.to(gl.uint32, bitcast=True)
-    amax_u32 = (amax_u32 + 0x3FFFFF) & 0xFF800000
+    amax_u32 = (amax_u32 + 0x400000) & 0xFF800000
     raw_exp = (amax_u32 >> 23) & 0xFF
     e8m0 = gl.maximum(raw_exp, 2) - 2
     e8m0_u8 = e8m0.to(gl.uint8)

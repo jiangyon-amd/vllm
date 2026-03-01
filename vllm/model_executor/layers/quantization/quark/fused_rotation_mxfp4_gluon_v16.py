@@ -76,13 +76,15 @@ def _fused_rot_quant_unified(
     acc = gl.zeros((BLOCK_M, RS), gl.float32, layout=mfma_layout)
     acc = gl.amd.cdna4.mfma(gl.convert_layout(x_tile, dot_a),
                              smem_rot.load(layout=dot_b), acc)
+    # Truncate to bf16 precision to match torch matmul (prevent decode drift)
+    acc = acc.to(gl.bfloat16).to(gl.float32)
 
     # ======== Quantization in MFMA layout ========
     acc_g = gl.reshape(acc, (BLOCK_M, NUM_QG, QG))
     amax = gl.max(gl.abs(acc_g), axis=-1)
 
     amax_u32 = amax.to(gl.uint32, bitcast=True)
-    amax_u32 = (amax_u32 + 0x3FFFFF) & 0xFF800000
+    amax_u32 = (amax_u32 + 0x400000) & 0xFF800000
     raw_exp = (amax_u32 >> 23) & 0xFF
     e8m0 = gl.maximum(raw_exp, 2) - 2
     e8m0_u8 = e8m0.to(gl.uint8)

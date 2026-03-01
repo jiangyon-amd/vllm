@@ -154,7 +154,7 @@ try:
         if rotation is not None and rotation_size > 0 and _has_fused_triton_rot_quant:
             x_2d = x.reshape(-1, x.shape[-1])
             if M > 32:
-                # v15: fused shuffle for large M (prefill)
+                # Prefill: fused shuffle
                 sn_pad = (x.shape[-1] // 32 + 7) // 8 * 8
                 sm_pad = (M + 255) // 256 * 256
                 fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
@@ -162,11 +162,11 @@ try:
                 x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
                                                   fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=True)
             else:
-                # v13: no shuffle, no padding — fast decode path
+                # Decode: no shuffle, no padding
                 fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
                 sc_buf = torch.empty((M, x.shape[-1] // 32), dtype=torch.uint8, device=x.device)
-                x_q, x_s = _fused_rot_quant_impl(x_2d, rotation, rotation_size,
-                                                   fp4_out=fp4_buf, scales_out=sc_buf)
+                x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
+                                                  fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=False)
             x_q = x_q.view(torch.float4_e2m1fn_x2)
             x_s = x_s.view(torch.float8_e8m0fnu)
             x_scales = x_s
@@ -327,7 +327,11 @@ class QuarkOCP_MX(QuarkScheme):
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
 
         # Fused rotation+quant: use Triton kernel when available
-        self.use_fused_rotation_quant = False
+        self.use_fused_rotation_quant = (
+            self.use_online_rotation
+            and _has_fused_triton_rot_quant
+            and not self.emulate
+        )
         if self.use_fused_rotation_quant:
             logger.info("Using fused Triton rotation+MXFP4 quant kernel")
 
