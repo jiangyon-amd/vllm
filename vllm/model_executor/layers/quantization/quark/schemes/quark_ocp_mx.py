@@ -167,7 +167,7 @@ try:
                 sn_pad = (x.shape[-1] // 32 + 7) // 8 * 8
                 sm_pad = (M + 255) // 256 * 256
                 fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
-                sc_buf = torch.zeros((sm_pad, sn_pad), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.empty((sm_pad, sn_pad), dtype=torch.uint8, device=x.device)
                 x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
                                                   fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=True)
             x_q = x_q.view(torch.float4_e2m1fn_x2)
@@ -288,8 +288,6 @@ class QuarkOCP_MX(QuarkScheme):
         ) = OrthogonalTransform.setup_transform(
             quant_config=quant_config, layer_names=layer_names
         )
-        if self.use_online_rotation:
-
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
 
