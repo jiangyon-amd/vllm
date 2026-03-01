@@ -145,7 +145,7 @@ def _fused_rot_quant_unified(
         flat_idx = i3[None, :] * 256 + i5[None, :] * 64 + i2[:, None] * 4 + i4[None, :] * 2 + i1[:, None]
         sh_row = flat_idx // sn_padded + m_base
         sh_col = flat_idx % sn_padded
-        sc_mask_sh = sh_row < M
+        sc_mask_sh = sh_row < (m_base + BLOCK_M)
         gl.amd.cdna4.buffer_store(stored_value=sc_s, ptr=scale_ptr,
             offsets=sh_row * stride_sc_m + sh_col, mask=sc_mask_sh)
     else:

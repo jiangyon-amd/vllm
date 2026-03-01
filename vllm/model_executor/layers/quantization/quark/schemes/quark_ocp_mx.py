@@ -153,20 +153,23 @@ try:
         # Fused rotation+quant if rotation provided
         if rotation is not None and rotation_size > 0 and _has_fused_triton_rot_quant:
             x_2d = x.reshape(-1, x.shape[-1])
-            if M > 32:
-                # Prefill: fused shuffle
+            # Determine shuffle mode based on downstream GEMM path
+            # tuned path (gemm_afp4wfp4) with M<32: needs raw scales (no shuffle)
+            # untuned path (gemm_a4w4) or M>=32: needs shuffled scales
+            if rocm_use_aiter_fp4_asm_gemm and M < 32 and M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
+                # Tuned decode: raw scales
+                fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.empty((M, x.shape[-1] // 32), dtype=torch.uint8, device=x.device)
+                x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
+                                                  fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=False)
+            else:
+                # Prefill or untuned decode: shuffled scales
                 sn_pad = (x.shape[-1] // 32 + 7) // 8 * 8
                 sm_pad = (M + 255) // 256 * 256
                 fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
                 sc_buf = torch.zeros((sm_pad, sn_pad), dtype=torch.uint8, device=x.device)
                 x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
                                                   fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=True)
-            else:
-                # Decode: no shuffle, no padding
-                fp4_buf = torch.empty((M, x.shape[-1] // 2), dtype=torch.uint8, device=x.device)
-                sc_buf = torch.empty((M, x.shape[-1] // 32), dtype=torch.uint8, device=x.device)
-                x_q, x_s = _fused_rot_quant_v16(x_2d, rotation, rotation_size,
-                                                  fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=False)
             x_q = x_q.view(torch.float4_e2m1fn_x2)
             x_s = x_s.view(torch.float8_e8m0fnu)
             x_scales = x_s
@@ -286,7 +289,6 @@ class QuarkOCP_MX(QuarkScheme):
             quant_config=quant_config, layer_names=layer_names
         )
         if self.use_online_rotation:
-            import sys; print(f"[ROTATION DEBUG] layer_names={layer_names} -> rotation ENABLED, size={self.rotation_size}", file=sys.stderr, flush=True)
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
