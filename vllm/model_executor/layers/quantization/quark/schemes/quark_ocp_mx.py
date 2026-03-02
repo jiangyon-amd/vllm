@@ -40,11 +40,8 @@ from .quark_scheme import QuarkScheme
 # Fused rotation + MXFP4 quantization kernel (Gluon v13) — registered as custom op
 _has_fused_triton_rot_quant = False
 try:
-    from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_gluon import (
-        fused_gluon_v13 as _fused_rot_quant_impl,
-    )
-    from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_gluon_v16 import (
-        fused_gluon_unified as _fused_rot_quant_v16,
+    from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon_v2 import (
+        fused_gluon_v2 as _fused_rot_quant_v16,
     )
     from vllm.utils.torch_utils import direct_register_custom_op
 
