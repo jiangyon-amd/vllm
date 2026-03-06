@@ -57,6 +57,7 @@ class OrthogonalTransform(torch.nn.Module):
             ):
                 use_online_rotation = True
                 rotation_size = rotation_config["rotation_size"]
+                logger.info("Online rotation enabled for %s (size=%d)", layer_names, rotation_size)
 
                 if rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")

@@ -43,6 +43,15 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+try:
+    from vllm.model_executor.layers.quantization.quark.transform import (
+        OrthogonalTransform,
+        rotation_weight_loader,
+    )
+    from vllm.model_executor.parameter import ModelWeightParameter
+    _has_rotation_support = True
+except ImportError:
+    _has_rotation_support = False
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -181,6 +190,52 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.moe_input_transform = None
+        self._init_moe_rotation(quant_config, config, prefix)
+
+    def _init_moe_rotation(self, quant_config, config, prefix):
+        """Initialize online rotation for MoE expert inputs."""
+        if not _has_rotation_support or quant_config is None:
+            return
+        qc = getattr(quant_config, 'quant_config', None)
+        if qc is None:
+            return
+        algo_list = qc.get('algo_config', [])
+        if not algo_list or algo_list[0].get('name') != 'rotation':
+            return
+
+        rot_cfg = algo_list[0]
+        online_cfg = rot_cfg.get('online_config', {})
+        online_layers = online_cfg.get('online_rotation_layers', [])
+        if not online_layers:
+            return
+
+        sample_marker = f"{prefix}.experts"
+        if not any(sample_marker in l for l in online_layers):
+            return
+
+        rotation_size = rot_cfg.get('rotation_size', 128)
+        dtype = torch.float64 if rot_cfg.get('trainable', False) else torch.int8
+
+        input_rotation = ModelWeightParameter(
+            data=torch.empty(rotation_size, rotation_size, dtype=dtype),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=rotation_weight_loader,
+        )
+        self.register_parameter("w13_input_rotation", input_rotation)
+        self.moe_rotation_config = rot_cfg
+        self.moe_rotation_size = rotation_size
+        self.moe_input_transform = OrthogonalTransform(
+            self.w13_input_rotation, rot_cfg
+        )
+        logger.info("MoE rotation enabled for %s (rotation_size=%d)", prefix, rotation_size)
+
+    def post_process_moe_rotation(self):
+        """Post-process rotation weights after loading (int8 → float)."""
+        if self.moe_input_transform is not None:
+            self.moe_input_transform.post_process_transform()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
@@ -193,7 +248,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
+        # Router uses ORIGINAL hidden_states (before rotation)
         router_logits, _ = self.gate(hidden_states)
+
+        if self.moe_input_transform is not None:
+            hidden_states = self.moe_input_transform(hidden_states)
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -503,7 +563,35 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        rotation_loaded: set[str] = set()
         for name, loaded_weight in weights:
+            # Handle rotation weights (input_rotation suffix)
+            if "input_rotation" in name:
+                import re
+                # MoE rotation: experts.{i}.gate_proj.input_rotation → mlp.w13_input_rotation
+                m_moe = re.match(r"(.*)\.mlp\.experts\.\d+\.\w+\.input_rotation", name)
+                if m_moe:
+                    rot_param_name = f"{m_moe.group(1)}.mlp.w13_input_rotation"
+                    if rot_param_name in params_dict and rot_param_name not in rotation_loaded:
+                        param = params_dict[rot_param_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
+                        rotation_loaded.add(rot_param_name)
+                        loaded_params.add(rot_param_name)
+                    continue
+                # Attention rotation: q_proj.input_rotation → qkv_proj.input_rotation
+                m_attn = re.match(r"(.*)\.self_attn\.(q|k|v)_proj\.input_rotation", name)
+                if m_attn:
+                    rot_param_name = f"{m_attn.group(1)}.self_attn.qkv_proj.input_rotation"
+                    if rot_param_name in params_dict and rot_param_name not in rotation_loaded:
+                        param = params_dict[rot_param_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
+                        rotation_loaded.add(rot_param_name)
+                        loaded_params.add(rot_param_name)
+                    continue
+                # Skip any other input_rotation weights
+                continue
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
@@ -528,6 +616,8 @@ class Qwen3MoeModel(nn.Module):
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
+                    continue
+                if "input_rotation" in name and param_name in name:
                     continue
                 name = name.replace(weight_name, param_name)
 
@@ -629,6 +719,11 @@ class Qwen3MoeModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        for layer in self.layers:
+            if hasattr(layer, 'mlp') and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                layer.mlp.post_process_moe_rotation()
+
         return loaded_params
 
 
