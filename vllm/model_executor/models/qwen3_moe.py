@@ -247,12 +247,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
-        # Router uses ORIGINAL hidden_states (before rotation)
         router_logits, _ = self.gate(hidden_states)
 
         if self.moe_input_transform is not None:
-            hidden_states = self.moe_input_transform(hidden_states)
+            from vllm.model_executor.layers.quantization.quark.fused_moe_rotation import (
+                FUSED_MOE_ROTATION,
+            )
+            if FUSED_MOE_ROTATION and hasattr(self, 'w13_input_rotation'):
+                self.experts._moe_rotation = self.w13_input_rotation.data
+                self.experts._moe_rotation_size = self.moe_rotation_size
+            else:
+                hidden_states = self.moe_input_transform(hidden_states)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits

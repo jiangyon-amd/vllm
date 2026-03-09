@@ -745,7 +745,34 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if not self.emulate:
+        rotation = getattr(layer, '_moe_rotation', None)
+        rotation_size = 128
+        if rotation is not None:
+            rotation_size = getattr(layer, '_moe_rotation_size', 128)
+            if hasattr(layer, '_moe_rotation'):
+                delattr(layer, '_moe_rotation')
+            if hasattr(layer, '_moe_rotation_size'):
+                delattr(layer, '_moe_rotation_size')
+
+        if rotation is not None and not self.emulate:
+            from vllm.model_executor.layers.quantization.quark.fused_moe_rotation import (
+                fused_moe_with_rotation,
+            )
+
+            out = fused_moe_with_rotation(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                rotation=rotation,
+                rotation_size=rotation_size,
+                w1_scale=self.moe_quant_config.w1_scale,
+                w2_scale=self.moe_quant_config.w2_scale,
+                expert_mask=layer.expert_map,
+                activation_str=layer.activation,
+            )
+        elif not self.emulate:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
                 rocm_aiter_fused_experts,
             )
