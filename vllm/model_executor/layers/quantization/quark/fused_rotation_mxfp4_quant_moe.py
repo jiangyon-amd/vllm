@@ -67,15 +67,15 @@ def _fused_rotation_mxfp4_quant_kernel(
     # Scale calculation (per group amax)
     amax = tl.max(tl.abs(acc_g), axis=-1)  # [BLOCK_M, NUM_QG]
 
-    # Scale calculation — match aiter's rounding (0x200000)
-    amax_i32 = amax.to(tl.int32, bitcast=True)
-    amax_rounded = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax_f32 = amax_rounded.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax_f32).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    e8m0_u8 = (scale_e8m0_unbiased.to(tl.uint8) + 127)
+    # Scale: 0x400000 rounding + e8m0 = max(raw_exp, 2) - 2 (aiter-compatible)
+    amax_u32 = amax.to(tl.uint32, bitcast=True)
+    amax_u32 = (amax_u32 + 0x400000) & 0xFF800000
+    raw_exp = (amax_u32 >> 23) & 0xFF
+    e8m0 = tl.maximum(raw_exp, 2) - 2
+    e8m0_u8 = e8m0.to(tl.uint8)
 
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    # quant_scale = 2^(127-e8m0) = 1/hw_scale, for SW FP4 conversion
+    quant_scale = tl.exp2(127.0 - e8m0.to(tl.float32))
 
     # Quantize: scale activations
     quant_scale_full = tl.reshape(

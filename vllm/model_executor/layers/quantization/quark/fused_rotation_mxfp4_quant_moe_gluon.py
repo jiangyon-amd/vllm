@@ -2,7 +2,7 @@
 Fused Rotation + MXFP4 Quantization for MoE experts — Gluon version.
 
 Uses AMD Gluon (MFMA + buffer_load/store + shared memory) for rotation matmul,
-with aiter-compatible scale rounding (0x200000) and software FP4 conversion.
+with aiter-compatible scale rounding (0x400000) and software FP4 conversion.
 """
 
 import torch
@@ -73,22 +73,19 @@ def _fused_rot_quant_moe_gluon(
                              smem_rot.load(layout=dot_b), acc)
     acc = acc.to(gl.bfloat16).to(gl.float32)
 
-    # ======== Quantization — aiter-compatible (0x200000 rounding) ========
+    # ======== Quantization — aiter-compatible (0x400000 rounding) ========
     acc_g = gl.reshape(acc, (BLOCK_M, NUM_QG, QG))
     amax = gl.max(gl.abs(acc_g), axis=-1)
 
-    # aiter-style scale: 0x200000 rounding (round-to-nearest)
-    amax_i32 = amax.to(gl.int32, bitcast=True)
-    amax_rounded = (amax_i32 + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
-    amax_f32 = amax_rounded.to(gl.float32, bitcast=True)
-    scale_unbiased = gl.log2(amax_f32)
-    # floor via int truncation
-    scale_unbiased = scale_unbiased.to(gl.int32).to(gl.float32) - 2.0
-    scale_unbiased = gl.maximum(gl.minimum(scale_unbiased, 127.0), -127.0)
-    e8m0_u8 = (scale_unbiased.to(gl.int32) + 127).to(gl.uint8)
+    # Scale: 0x400000 rounding + e8m0 = max(raw_exp, 2) - 2
+    amax_u32 = amax.to(gl.uint32, bitcast=True)
+    amax_u32 = (amax_u32 + 0x400000) & 0xFF800000
+    raw_exp = (amax_u32 >> 23) & 0xFF
+    e8m0 = gl.maximum(raw_exp, 2) - 2
+    e8m0_u8 = e8m0.to(gl.uint8)
 
-    # ======== Software FP4 conversion (aiter-compatible, 100% match) ========
-    quant_scale = gl.exp2(-scale_unbiased)
+    # ======== Software FP4 conversion (aiter-compatible) ========
+    quant_scale = gl.exp2(127.0 - e8m0.to(gl.float32))
     quant_scale_full = acc_g * 0.0 + gl.expand_dims(quant_scale, axis=2)
     qx = acc_g * quant_scale_full
     qx_flat = gl.reshape(qx, (BLOCK_M, RS))

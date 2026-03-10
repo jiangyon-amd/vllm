@@ -66,8 +66,7 @@ class OrthogonalTransform(torch.nn.Module):
 
     def post_process_transform(self):
         if self.rotation_config is not None and not self.rotation_config["trainable"]:
-            # In case hadamard transform is used (non-trained case), it is
-            # serialized as torch.int8 with only `-1` and `1` values.
+            # Hadamard transform: serialized as int8 ±1, normalize by 1/sqrt(N)
             self.input_rotation.data = self.input_rotation.data.to(
                 torch.float
             ) / math.sqrt(self.rotation_size)

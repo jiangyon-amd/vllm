@@ -11,6 +11,7 @@
 #include <hip/hip_bf16.h>
 
 using fp16x8 = __attribute__((ext_vector_type(8))) _Float16;
+using fp16x4 = __attribute__((ext_vector_type(4))) _Float16;
 using fp32x4 = __attribute__((ext_vector_type(4))) float;
 
 template<int RS, int BLOCK_M>
@@ -29,7 +30,7 @@ void fused_rotation_quant_mfma_kernel(
     constexpr int THREADS = 256;
     constexpr int WAVES = 4;
     constexpr int N_TILES = RS / 16;
-    constexpr int K_ITERS = RS / 32;
+    constexpr int K_ITERS = RS / 16;  // MFMA 16x16x16: each iter covers K=16
     constexpr int M_TILES = BLOCK_M / 16;
     constexpr int QG = 32;
     constexpr int NUM_QG = RS / QG;
@@ -66,16 +67,19 @@ void fused_rotation_quant_mfma_kernel(
     __syncthreads();
 
     // === Step 2: MFMA Rotation (preload B, unrolled) ===
+    // MFMA 16x16x16_f16: matches Gluon v2's k_width=4 accumulation pattern
+    // Each lane loads 4 bf16→fp16 values (not 8), K step = 16 (not 32)
+    // Lane mapping: A row = lane%16, A k_group = (lane/16)*4, 4 groups of 4
     for (int n_tile = wave_id; n_tile < N_TILES; n_tile += WAVES) {
-        fp16x8 b_vecs[K_ITERS];
+        fp16x4 b_vecs[K_ITERS];
         const int b_col = n_tile * 16 + (lane_id % 16);
-        const int b_k_group = (lane_id / 16) * 8;
+        const int b_k_group = (lane_id / 16) * 4;
 
         #pragma unroll
         for (int ki = 0; ki < K_ITERS; ki++) {
-            const int b_k_base = ki * 32 + b_k_group;
+            const int b_k_base = ki * 16 + b_k_group;
             #pragma unroll
-            for (int j = 0; j < 8; j++)
+            for (int j = 0; j < 4; j++)
                 b_vecs[ki][j] = (_Float16)__bfloat162float(rot_lds[(b_k_base + j) * RS + b_col]);
         }
 
@@ -83,24 +87,25 @@ void fused_rotation_quant_mfma_kernel(
         for (int m_tile = 0; m_tile < M_TILES; m_tile++) {
             fp32x4 acc = {0, 0, 0, 0};
             const int a_row = m_tile * 16 + (lane_id % 16);
-            const int a_k_group = (lane_id / 16) * 8;
+            const int a_k_group = (lane_id / 16) * 4;
 
             #pragma unroll
             for (int ki = 0; ki < K_ITERS; ki++) {
-                fp16x8 a_vec;
-                const __bf16* a_ptr = &a_lds[a_row * RS + ki * 32 + a_k_group];
+                fp16x4 a_vec;
+                const __bf16* a_ptr = &a_lds[a_row * RS + ki * 16 + a_k_group];
                 #pragma unroll
-                for (int j = 0; j < 8; j++)
+                for (int j = 0; j < 4; j++)
                     a_vec[j] = (_Float16)__bfloat162float(a_ptr[j]);
 
-                acc = __builtin_amdgcn_mfma_f32_16x16x32_f16(a_vec, b_vecs[ki], acc, 0, 0, 0);
+                acc = __builtin_amdgcn_mfma_f32_16x16x16f16(a_vec, b_vecs[ki], acc, 0, 0, 0);
             }
 
             const int c_col = n_tile * 16 + (lane_id % 16);
             const int c_row = m_tile * 16 + (lane_id / 16) * 4;
             #pragma unroll
             for (int i = 0; i < 4; i++)
-                rotated[(c_row + i) * RS + c_col] = acc[i];
+                // bf16 truncation to match Gluon v2: acc.to(bf16).to(fp32)
+                rotated[(c_row + i) * RS + c_col] = __bfloat162float(__float2bfloat16(acc[i]));
         }
     }
     __syncthreads();
