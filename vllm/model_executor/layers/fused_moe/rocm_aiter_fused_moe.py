@@ -191,6 +191,8 @@ def rocm_aiter_fused_experts(
     a1q_scale: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    rotation: torch.Tensor | None = None,
+    rotation_size: int = 0,
 ) -> torch.Tensor:
     if quant_config is None:
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
@@ -283,6 +285,8 @@ def rocm_aiter_fused_experts(
             doweight_stage1=apply_router_weight_on_input,
             num_local_tokens=num_local_tokens,
             output_dtype=output_dtype,
+            rotation=rotation,
+            rotation_size=rotation_size,
         )
 
 

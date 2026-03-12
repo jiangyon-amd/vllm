@@ -229,12 +229,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.moe_input_transform = OrthogonalTransform(
             self.w13_input_rotation, rot_cfg
         )
-        logger.info("MoE rotation enabled for %s (rotation_size=%d)", prefix, rotation_size)
+        from vllm.model_executor.layers.quantization.quark.fused_moe_rotation import (
+            FUSED_MOE_ROTATION, _has_moe_rot_quant,
+        )
+        self._use_fused_moe_rotation = FUSED_MOE_ROTATION and _has_moe_rot_quant
+        mode = "fused" if self._use_fused_moe_rotation else "separated"
+        logger.info("MoE rotation enabled for %s (rotation_size=%d, mode=%s)", prefix, rotation_size, mode)
 
     def post_process_moe_rotation(self):
         """Post-process rotation weights after loading (int8 → float)."""
         if self.moe_input_transform is not None:
             self.moe_input_transform.post_process_transform()
+            if self._use_fused_moe_rotation:
+                self.experts._moe_rotation = self.w13_input_rotation.data
+                self.experts._moe_rotation_size = self.moe_rotation_size
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
@@ -250,12 +258,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
 
         if self.moe_input_transform is not None:
-            from vllm.model_executor.layers.quantization.quark.fused_moe_rotation import (
-                FUSED_MOE_ROTATION,
-            )
-            if FUSED_MOE_ROTATION and hasattr(self, 'w13_input_rotation'):
-                self.experts._moe_rotation = self.w13_input_rotation.data
-                self.experts._moe_rotation_size = self.moe_rotation_size
+            if self._use_fused_moe_rotation:
+                pass  # rotation handled inside rocm_aiter_fused_moe via _moe_rotation
             else:
                 hidden_states = self.moe_input_transform(hidden_states)
 

@@ -121,7 +121,7 @@ def _fused_rot_quant_hip_kernel(
                     + i2[:, None] * 4 + i4[None, :] * 2 + i1[:, None])
         sh_row = flat_idx // sn_padded + m_base
         sh_col = flat_idx % sn_padded
-        sc_mask_sh = sh_row < (m_base + BLOCK_M)
+        sc_mask_sh = (sh_row < M) & m_mask[:, None]
         sc_offsets = sh_row * stride_sc_m + sh_col
         tl.store(scale_ptr + sc_offsets, e8m0_u8, mask=sc_mask_sh)
     else:
@@ -157,7 +157,20 @@ def fused_rotation_quant_hip(x, rotation, rotation_size=128, fp4_out=None, scale
         if scales_out is None:
             scales_out = torch.empty((M, n_scales), dtype=torch.uint8, device=x.device)
 
-    BLOCK_M = 32
+    # Decode/small-batch path benefits from smaller tiles.
+    if M <= 4:
+        BLOCK_M = 4
+        NUM_WARPS = 1
+        NUM_STAGES = 2
+    elif M <= 16:
+        BLOCK_M = 16
+        NUM_WARPS = 2
+        NUM_STAGES = 2
+    else:
+        BLOCK_M = 32
+        NUM_WARPS = 4
+        NUM_STAGES = 3
+
     grid = (triton.cdiv(M, BLOCK_M), K // RS)
 
     _fused_rot_quant_hip_kernel[grid](
@@ -167,7 +180,8 @@ def fused_rotation_quant_hip(x, rotation, rotation_size=128, fp4_out=None, scale
         fp4_out.stride(0), scales_out.stride(0),
         RS=RS, QG=QGROUP, BLOCK_M=BLOCK_M,
         SHUFFLE_SCALES=shuffle_scales,
-        num_warps=4,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
     )
 
     return fp4_out, scales_out

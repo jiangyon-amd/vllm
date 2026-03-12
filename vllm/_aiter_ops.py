@@ -81,6 +81,8 @@ def _rocm_aiter_fused_moe_impl(
     a2_scale: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    rotation: torch.Tensor | None = None,
+    rotation_size: int = 0,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -104,6 +106,8 @@ def _rocm_aiter_fused_moe_impl(
         a2_scale,
         num_local_tokens=num_local_tokens,
         dtype=output_dtype,
+        rotation=rotation,
+        rotation_size=rotation_size,
     )
 
 
@@ -123,6 +127,8 @@ def _rocm_aiter_fused_moe_fake(
     a2_scale: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    rotation: torch.Tensor | None = None,
+    rotation_size: int = 0,
 ) -> torch.Tensor:
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
@@ -1246,6 +1252,8 @@ class rocm_aiter_ops:
         a2_scale: torch.Tensor | None = None,
         num_local_tokens: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
+        rotation: torch.Tensor | None = None,
+        rotation_size: int = 0,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -1263,6 +1271,8 @@ class rocm_aiter_ops:
             a2_scale,
             num_local_tokens,
             output_dtype,
+            rotation,
+            rotation_size,
         )
 
     @staticmethod
