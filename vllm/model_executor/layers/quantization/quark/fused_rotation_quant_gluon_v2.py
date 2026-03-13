@@ -57,7 +57,7 @@ def _fused_rot_quant_decode_topk8_special(
     col_base = pid_rot * RS
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True,
+        version=4, instr_shape=[16, 16, 32], transposed=True,
         warps_per_cta=[2, 2], tiles_per_warp=[1, 4],
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
@@ -133,20 +133,27 @@ def _fused_rot_quant_decode_topk8_special(
     fp4_c = fp4_base + gl.arange(0, RS // 2, layout=gl.SliceLayout(0, fp4_store))
     tl.store(fp4_ptr + s_m[:, None] * stride_fp4_m + fp4_c[None, :], packed_s, mask=s_mask[:, None])
 
-    # Write raw scale to row-0 of scale_ptr, then do scatter in a second phase.
+    # Extract scale values from Gluon layout to blocked layout, then scatter.
+    # For decode M=1, all sorted_ids share the same scale values (one row).
     sc_store2: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1], threads_per_warp=[32, 2],
         warps_per_cta=[4, 1], order=[1, 0],
     )
     sc_s = gl.convert_layout(e8m0_u8, sc_store2)
-    # Write raw scales to a temp row beyond the valid output area (row = m_o).
+
+    # Write raw scale to a temp row (row = m_o) for scatter to read back.
+    # This is needed because Gluon's layout for e8m0_u8 cannot be directly
+    # used in the tl.store scatter loop.
     sc_tmp_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
     sc_tmp_mask = sc_tmp_m < 1
     sc_tmp_c = pid_rot * NUM_QG + gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
     tl.store(scale_ptr + (m_o + sc_tmp_m[:, None]) * stride_sc_m + sc_tmp_c[None, :], sc_s, mask=sc_tmp_mask[:, None])
 
-    # Scatter sorted scale: loop over NUM_QG columns (outer), then q-blocks (inner).
-    # This way each scale value is loaded once from the temp row and reused.
+    # Scatter sorted scale using the block-diagonal independence:
+    # Each pid_rot produces NUM_QG=4 scale columns. For decode M=1, these
+    # 4 values are the same for all sorted_ids (single token).
+    # We read them once from the temp row, then broadcast-write to all
+    # sorted_ids destinations.
     sc_scatter: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1], threads_per_warp=[64, 1],
         warps_per_cta=[4, 1], order=[1, 0],
@@ -157,6 +164,8 @@ def _fused_rot_quant_decode_topk8_special(
 
     for c in tl.static_range(0, NUM_QG):
         col = pid_rot * NUM_QG + c
+        # Read this column's scale value once from the temp row.
+        # Use q*0 trick to give it the right layout for tl.store.
         pid_n = col >> 3
         n_local = col & 3
         half = (col & 7) >> 2
@@ -175,6 +184,7 @@ def _fused_rot_quant_decode_topk8_special(
             flat = (((pid_m_out * tile_n + pid_n) * 4 + n_local) * 16 + m_local) * 4 + i
             dst_row = flat // n_i
             dst_col = flat % n_i
+            # Read scale from temp row — broadcast same value to all q lanes.
             val = tl.load(scale_ptr + m_o * stride_sc_m + col + q * 0)
             tl.store(
                 scale_ptr + dst_row * stride_sc_m + dst_col,
@@ -206,7 +216,7 @@ def _fused_rot_quant_v2(
 
     # ======== Layouts ========
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True,
+        version=4, instr_shape=[16, 16, 32], transposed=True,
         warps_per_cta=[2, 2], tiles_per_warp=[1, 4],
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
