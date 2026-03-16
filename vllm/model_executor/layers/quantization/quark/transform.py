@@ -48,16 +48,26 @@ class OrthogonalTransform(torch.nn.Module):
         ):
             rotation_config = quant_config["algo_config"][0]
 
-            online_rotation_layers = rotation_config["online_config"][
-                "online_rotation_layers"
-            ]
+            online_config = rotation_config.get("online_config") or {}
+            online_rotation_layers = online_config.get("online_rotation_layers")
+
+            # Quark 0.11 Hadamard format: online_config is null, infer from
+            # online_r1_rotation flag and scaling_layers structure.
+            if not online_rotation_layers and rotation_config.get("online_r1_rotation"):
+                scaling = rotation_config.get("scaling_layers", {})
+                online_rotation_layers = set()
+                for group in ("first_layer", "middle_layers", "last_layer"):
+                    for entry in scaling.get(group, []):
+                        for mod in entry.get("next_modules", []):
+                            base = mod.replace("model.layers.layer_id.", "").replace("model.layers.pre_layer_id.", "")
+                            online_rotation_layers.add(base)
+                online_rotation_layers = list(online_rotation_layers) if online_rotation_layers else None
 
             if online_rotation_layers is not None and any(
-                layer_name in online_rotation_layers for layer_name in layer_names
+                any(ol in layer_name for ol in online_rotation_layers) for layer_name in layer_names
             ):
                 use_online_rotation = True
                 rotation_size = rotation_config["rotation_size"]
-                logger.info("Online rotation enabled for %s (size=%d)", layer_names, rotation_size)
 
                 if rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")
@@ -66,7 +76,8 @@ class OrthogonalTransform(torch.nn.Module):
 
     def post_process_transform(self):
         if self.rotation_config is not None and not self.rotation_config["trainable"]:
-            # Hadamard transform: serialized as int8 ±1, normalize by 1/sqrt(N)
+            # In case hadamard transform is used (non-trained case), it is
+            # serialized as torch.int8 with only `-1` and `1` values.
             self.input_rotation.data = self.input_rotation.data.to(
                 torch.float
             ) / math.sqrt(self.rotation_size)

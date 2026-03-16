@@ -57,7 +57,7 @@ def _fused_rot_quant_decode_topk8_special(
     col_base = pid_rot * RS
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True,
+        version=4, instr_shape=[16, 16], transposed=True,
         warps_per_cta=[2, 2], tiles_per_warp=[1, 4],
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
@@ -71,8 +71,8 @@ def _fused_rot_quant_decode_topk8_special(
     shared_rot: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0],
     )
-    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
-    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=4)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=4)
 
     BLOCK_M: gl.constexpr = 32
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
@@ -216,7 +216,7 @@ def _fused_rot_quant_v2(
 
     # ======== Layouts ========
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True,
+        version=4, instr_shape=[16, 16], transposed=True,
         warps_per_cta=[2, 2], tiles_per_warp=[1, 4],
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(

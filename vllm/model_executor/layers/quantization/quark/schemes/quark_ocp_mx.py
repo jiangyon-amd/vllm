@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from fractions import Fraction
+import os
 from functools import cache, partial
 from typing import Any
 
@@ -328,6 +329,7 @@ class QuarkOCP_MX(QuarkScheme):
             self.use_online_rotation
             and _has_fused_triton_rot_quant
             and not self.emulate
+            and not os.environ.get("VLLM_DISABLE_FUSED_ROT_QUANT")
         )
         if self.use_fused_rotation_quant:
             logger.info("Using fused Triton rotation+MXFP4 quant kernel")
