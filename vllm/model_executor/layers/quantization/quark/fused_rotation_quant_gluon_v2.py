@@ -368,27 +368,37 @@ def _fused_rot_quant_v2(
                 mask = q_valid & col_valid
                 tl.store(scale_ptr + dst_row * stride_sc_m + dst_col, vals, mask=mask)
     elif SHUFFLE_SCALES:
-        # Pad e8m0 to match fp4_store's N dimension, then extract
-        # Actually we can't reuse fp4_store directly (shape mismatch)
-        # Use a minimal blocked layout instead
+        # Two-phase shuffle via global temp rows.
+        # gl.convert_layout loses data for NUM_QG>2 with threads_per_warp=[32,2],
+        # but raw store with SliceLayout broadcasting writes all values correctly.
         sc_store2: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1], threads_per_warp=[32, 2],
             warps_per_cta=[NUM_WARPS, 1], order=[1, 0],
         )
         sc_s = gl.convert_layout(e8m0_u8, sc_store2)
+        sc_m_idx = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
+        sc_q_idx = gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
+        sc_mask = (m_base + sc_m_idx[:, None]) < M
+        sc_base = pid_rot * NUM_QG
 
-        sc_m_local = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
-        sc_q = gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
-        orig_col = pid_rot * NUM_QG + sc_q
-        flat_idx = ((orig_col // 8)[None, :] * 256
-                  + (orig_col % 4)[None, :] * 64
-                  + (sc_m_local % 16)[:, None] * 4
-                  + ((orig_col % 8) // 4)[None, :] * 2
-                  + (sc_m_local // 16)[:, None])
-        sh_row = flat_idx // sn_padded + m_base
-        sh_col = flat_idx % sn_padded
-        sc_mask_sh = sh_row < (m_base + BLOCK_M)
-        tl.store(scale_ptr + sh_row * stride_sc_m + sh_col, sc_s, mask=sc_mask_sh)
+        # Phase 1: raw store to temp rows (past output area)
+        raw_off = ((M + 31) // 32) * 32
+        tl.store(scale_ptr + (m_base + sc_m_idx[:, None] + raw_off) * stride_sc_m
+                 + (sc_base + sc_q_idx[None, :]),
+                 sc_s, mask=sc_mask)
+
+        # Phase 2: load from temp, compute shuffled destination, store
+        raw_val = tl.load(scale_ptr + (m_base + sc_m_idx[:, None] + raw_off) * stride_sc_m
+                          + (sc_base + sc_q_idx[None, :]),
+                          mask=sc_mask, other=0)
+        col = sc_base + sc_q_idx
+        flat = ((col >> 3)[None, :] * 256
+                + (col & 3)[None, :] * 64
+                + (sc_m_idx & 15)[:, None] * 4
+                + ((col >> 2) & 1)[None, :] * 2
+                + (sc_m_idx >> 4)[:, None])
+        tl.store(scale_ptr + (flat // sn_padded + m_base) * stride_sc_m + flat % sn_padded,
+                 raw_val, mask=sc_mask)
     else:
         sc_store2: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1], threads_per_warp=[32, 2],
@@ -528,9 +538,13 @@ def fused_gluon_v2(
     elif shuffle_scales:
         sn_padded = (n_scales + 7) // 8 * 8
         sm_padded = (M + 255) // 256 * 256
+        raw_row_offset = ((M + 31) // 32) * 32
+        sm_with_temp = max(sm_padded, raw_row_offset + ((M + 31) // 32) * 32)
         max_q = 256
         if scales_out is None:
-            scales_out = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
+            scales_out = torch.empty((sm_with_temp, sn_padded), dtype=torch.uint8, device=x.device)
+        elif scales_out.shape[0] < sm_with_temp:
+            scales_out = torch.empty((sm_with_temp, sn_padded), dtype=torch.uint8, device=x.device)
     else:
         sn_padded = n_scales
         max_q = 256
