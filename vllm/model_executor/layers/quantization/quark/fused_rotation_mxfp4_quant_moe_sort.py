@@ -120,10 +120,12 @@ def _agent_debug_log(run_id: str, hypothesis_id: str, location: str, message: st
 
 
 def _pick_decode_max_q(m_pad: int) -> int:
-    # Fixed at 256: kernel processes first MAX_Q sorted_ids entries.
-    # num_valid_ids is typically << 256 for decode (M=1).
-    # Keeping MAX_Q small avoids bloating the scatter loop.
-    return 256
+    if m_pad <= 64:
+        return 64
+    elif m_pad <= 128:
+        return 128
+    else:
+        return 256
 
 
 @triton.jit

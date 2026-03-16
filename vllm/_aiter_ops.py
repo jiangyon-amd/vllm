@@ -90,6 +90,14 @@ def _rocm_aiter_fused_moe_impl(
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
+    # Pass rotation only if aiter fused_moe supports it
+    import inspect
+    _fused_moe_sig = inspect.signature(fused_moe)
+    extra_kwargs = {}
+    if 'rotation' in _fused_moe_sig.parameters:
+        extra_kwargs['rotation'] = rotation
+        extra_kwargs['rotation_size'] = rotation_size
+
     return fused_moe(
         hidden_states,
         w1,
@@ -106,8 +114,7 @@ def _rocm_aiter_fused_moe_impl(
         a2_scale,
         num_local_tokens=num_local_tokens,
         dtype=output_dtype,
-        rotation=rotation,
-        rotation_size=rotation_size,
+        **extra_kwargs,
     )
 
 
