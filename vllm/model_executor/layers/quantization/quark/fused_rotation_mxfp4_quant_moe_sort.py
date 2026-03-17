@@ -88,7 +88,7 @@ ENABLE_HIP_FUSED_ROTATION = (
     os.getenv("VLLM_MOE_HIP_FUSED_ROTATION", "0") == "1"
 )
 ENABLE_TRITON_ROT_SORT_FUSION = (
-    os.getenv("VLLM_MOE_TRITON_ROT_SORT_FUSION", "0") == "1"
+    os.getenv("VLLM_MOE_TRITON_ROT_SORT_FUSION", "1") == "1"
 )
 ENABLE_GLUON_KW8 = (
     os.getenv("VLLM_MOE_GLUON_KW8", "1") == "1"
@@ -330,6 +330,115 @@ def _fused_decode_m1_topk8_k2048_kernel(
 
 
 @triton.jit
+def _fused_decode_m1_topk8_general_kernel(
+    x_ptr,
+    rot_ptr,
+    fp4_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    sorted_scale_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_rot_r,
+    stride_rot_c,
+    stride_fp4_m,
+    stride_sc_m,
+    stride_sc_n,
+    token_num,
+    m_o,
+    N_I: tl.constexpr,
+    TILE_N: tl.constexpr,
+    MAX_Q: tl.constexpr,
+):
+    """Generalized topk=8 decode kernel — n_i/tile_n as constexpr for fast div/mod."""
+    RS: tl.constexpr = 128
+    QG: tl.constexpr = 32
+    NUM_QG: tl.constexpr = 4
+    HALF_QG: tl.constexpr = 16
+    pid_k = tl.program_id(0)
+    col_base = pid_k * NUM_QG
+
+    offs_k = tl.arange(0, RS)
+    x = tl.load(x_ptr + (pid_k * RS + offs_k) * stride_x_n).to(tl.float32)
+    offs_r = tl.arange(0, RS)
+    offs_c = tl.arange(0, RS)
+    rot = tl.load(
+        rot_ptr + offs_r[:, None] * stride_rot_r + offs_c[None, :] * stride_rot_c
+    ).to(tl.float32)
+    acc = tl.dot(x[None, :].to(tl.bfloat16), rot.to(tl.bfloat16))
+    acc = acc.to(tl.bfloat16).to(tl.float32)
+
+    acc_g = tl.reshape(acc, (1, NUM_QG, QG))
+    amax = tl.max(tl.abs(acc_g), axis=-1, keep_dims=False)
+
+    amax_u32 = amax.to(tl.uint32, bitcast=True)
+    amax_u32 = (amax_u32 + 0x200000) & 0xFF800000
+    raw_exp = (amax_u32 >> 23) & 0xFF
+    e8m0 = tl.maximum(raw_exp, 2) - 2
+    e8m0_u8 = e8m0.to(tl.uint8)
+
+    hw_scale = (e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+
+    acc_pairs = tl.reshape(acc_g, (1, NUM_QG, HALF_QG, 2))
+    even_vals, odd_vals = tl.split(acc_pairs)
+    even_flat = tl.reshape(even_vals, (1, NUM_QG * HALF_QG))
+    odd_flat = tl.reshape(odd_vals, (1, NUM_QG * HALF_QG))
+    hw_scale_broad = tl.broadcast_to(
+        tl.reshape(hw_scale, (1, NUM_QG, 1)), (1, NUM_QG, HALF_QG)
+    )
+    scale_flat = tl.reshape(hw_scale_broad, (1, NUM_QG * HALF_QG))
+
+    packed_u32 = tl.inline_asm_elementwise(
+        asm="v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        constraints="=v,v,v,v",
+        args=[even_flat, odd_flat, scale_flat],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    packed = packed_u32.to(tl.uint8)
+    packed = tl.reshape(packed, (RS // 2,))
+
+    fp4_offs_n = pid_k * (RS // 2) + tl.arange(0, RS // 2)
+    tl.store(fp4_ptr + fp4_offs_n, packed)
+
+    num_valid = tl.load(num_valid_ids_ptr)
+    q = tl.arange(0, MAX_Q)
+    sid = tl.load(sorted_ids_ptr + q, mask=q < num_valid, other=token_num)
+    tok = sid & 0xFFFFFF
+    q_valid = (q < num_valid) & (tok < token_num)
+
+    cols = col_base + tl.arange(0, NUM_QG)
+    col_valid = cols < N_I
+    vals_row = tl.reshape(e8m0_u8, (NUM_QG,))
+    vals = tl.broadcast_to(vals_row[None, :], (MAX_Q, NUM_QG))
+    vals = tl.where(q_valid[:, None], vals, 0)
+
+    pid_m_out = q >> 5
+    q_in = q & 31
+    q_half = q_in >> 4
+    m_local = q_in & 15
+    pid_n = cols >> 3
+    n_local = cols & 3
+    half = (cols & 7) >> 2
+    i = q_half[:, None] + (half[None, :] << 1)
+
+    flat = (
+        (((pid_m_out[:, None] * TILE_N + pid_n[None, :]) * 4 + n_local[None, :]) * 16
+         + m_local[:, None]) * 4 + i
+    )
+    dst_row = flat // N_I
+    dst_col = flat % N_I
+
+    mask = col_valid[None, :] & (q[:, None] < m_o)
+    tl.store(
+        sorted_scale_ptr + dst_row * stride_sc_m + dst_col * stride_sc_n,
+        vals,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _stage1_scale_from_shuffled_kernel(
     shuffled_ptr,
     sorted_ids_ptr,
@@ -489,14 +598,20 @@ def _fused_rot_quant_moe_sort_impl(
         fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
         sorted_u8 = torch.empty((m_pad, n_i), dtype=torch.uint8, device=x.device)
         grid = (K // RS,)
-        use_topk8_special = (
+        use_topk8_k2048 = (
             topk == 8
             and K == 2048
             and RS == 128
             and n_i == 64
             and max_q <= 256
         )
-        if use_topk8_special:
+        use_topk8_general = (
+            topk == 8
+            and RS == 128
+            and max_q <= 256
+            and not use_topk8_k2048
+        )
+        if use_topk8_k2048:
             _fused_decode_m1_topk8_k2048_kernel[grid](
                 x,
                 rotation,
@@ -513,6 +628,28 @@ def _fused_rot_quant_moe_sort_impl(
                 sorted_u8.stride(1),
                 token_num=token_num,
                 m_o=m_o,
+                MAX_Q=max_q,
+                num_warps=4,
+            )
+        elif use_topk8_general:
+            _fused_decode_m1_topk8_general_kernel[grid](
+                x,
+                rotation,
+                fp4_u8,
+                sorted_ids,
+                num_valid_ids,
+                sorted_u8,
+                x.stride(0),
+                x.stride(1),
+                rotation.stride(0),
+                rotation.stride(1),
+                fp4_u8.stride(0),
+                sorted_u8.stride(0),
+                sorted_u8.stride(1),
+                token_num=token_num,
+                m_o=m_o,
+                N_I=n_i,
+                TILE_N=triton.cdiv(n_i, 8),
                 MAX_Q=max_q,
                 num_warps=4,
             )

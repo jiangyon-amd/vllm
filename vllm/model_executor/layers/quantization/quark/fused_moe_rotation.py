@@ -10,7 +10,7 @@ path, so we keep this lightweight compatibility layer.
 
 import os
 
-FUSED_MOE_ROTATION = os.getenv("VLLM_MOE_FUSED_ROTATION", "0") == "1"
+FUSED_MOE_ROTATION = os.getenv("VLLM_MOE_FUSED_ROTATION", "1") == "1"
 
 try:
     # Validate that the fused MoE rotation implementation is importable.
