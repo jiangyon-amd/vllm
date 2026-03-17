@@ -9,8 +9,6 @@ Same kernel count, saves bf16 intermediate GMEM read/write.
 
 import os
 import logging
-import json
-import time
 import torch
 import triton
 import triton.language as tl
@@ -102,21 +100,6 @@ ENABLE_FUSED_MOE_DEBUG_LOG = (
 logger = logging.getLogger(__name__)
 _DISPATCH_LOG_KEYS: set[tuple] = set()
 _TRITON_PROTO_LOG_KEYS: set[tuple] = set()
-_DEBUG_LOG_PATH = "/data/jiangyon/.cursor/debug-d7954d.log"
-
-
-def _agent_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
-    payload = {
-        "sessionId": "d7954d",
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _pick_decode_max_q(m_pad: int) -> int:
@@ -167,35 +150,40 @@ def _fused_decode_m1_rot_quant_sorted_kernel(
     acc = tl.dot(x[None, :].to(tl.bfloat16), rot.to(tl.bfloat16))
     acc = acc.to(tl.bfloat16).to(tl.float32)
 
-    # MXFP4 quantization.
+    # MXFP4 quantization using v_cvt ISA (replaces ~15 lines of manual bit ops).
+    HALF_QG: tl.constexpr = QG // 2
     acc_g = tl.reshape(acc, (1, NUM_QG, QG))
     amax = tl.max(tl.abs(acc_g), axis=-1, keep_dims=False)
-    # Match aiter separated kernel's scale derivation exactly.
-    amax_i32 = amax.to(tl.int32, bitcast=True)
-    amax_u32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax_fp = amax_u32.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax_fp).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    e8m0_u8 = scale_e8m0_unbiased.to(tl.uint8) + 127  # [1, NUM_QG]
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
-    quant_scale_full = tl.reshape(
-        tl.broadcast_to(tl.reshape(quant_scale, (1, NUM_QG, 1)), (1, NUM_QG, QG)),
-        (1, RS),
+
+    # Direct exponent extraction (replaces log2/exp2/floor with simple bit ops)
+    amax_u32 = amax.to(tl.uint32, bitcast=True)
+    amax_u32 = (amax_u32 + 0x200000) & 0xFF800000
+    raw_exp = (amax_u32 >> 23) & 0xFF
+    e8m0 = tl.maximum(raw_exp, 2) - 2
+    e8m0_u8 = e8m0.to(tl.uint8)
+
+    # hw_scale for v_cvt (divides input by this value internally)
+    hw_scale = (e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+
+    # Reshape to even/odd pairs for v_cvt_scalef32_pk_fp4_f32
+    acc_pairs = tl.reshape(acc_g, (1, NUM_QG, HALF_QG, 2))
+    even_vals, odd_vals = tl.split(acc_pairs)
+    even_flat = tl.reshape(even_vals, (1, NUM_QG * HALF_QG))
+    odd_flat = tl.reshape(odd_vals, (1, NUM_QG * HALF_QG))
+    hw_scale_broad = tl.broadcast_to(
+        tl.reshape(hw_scale, (1, NUM_QG, 1)), (1, NUM_QG, HALF_QG)
     )
-    qx = (acc * quant_scale_full).to(tl.uint32, bitcast=True)
-    s = qx & 0x80000000
-    e = (qx >> 23) & 0xFF
-    m = qx & 0x7FFFFF
-    E8_BIAS: tl.constexpr = 127
-    E2_BIAS: tl.constexpr = 1
-    adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
-    m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
-    e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
-    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
-    e2m1 = ((s >> 28) | e2m1_tmp).to(tl.uint8)
-    e2m1 = tl.reshape(e2m1, (1, RS // 2, 2))
-    even, odd = tl.split(e2m1)
-    packed = even | (odd << 4)
+    scale_flat = tl.reshape(hw_scale_broad, (1, NUM_QG * HALF_QG))
+
+    packed_u32 = tl.inline_asm_elementwise(
+        asm="v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        constraints="=v,v,v,v",
+        args=[even_flat, odd_flat, scale_flat],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    packed = packed_u32.to(tl.uint8)
     packed = tl.reshape(packed, (RS // 2,))
 
     # Store fp4 for row 0.
@@ -275,34 +263,37 @@ def _fused_decode_m1_topk8_k2048_kernel(
     acc = tl.dot(x[None, :].to(tl.bfloat16), rot.to(tl.bfloat16))
     acc = acc.to(tl.bfloat16).to(tl.float32)
 
+    HALF_QG: tl.constexpr = 16
     acc_g = tl.reshape(acc, (1, NUM_QG, QG))
     amax = tl.max(tl.abs(acc_g), axis=-1, keep_dims=False)
-    amax_i32 = amax.to(tl.int32, bitcast=True)
-    amax_u32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax_fp = amax_u32.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax_fp).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    e8m0_u8 = scale_e8m0_unbiased.to(tl.uint8) + 127
 
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
-    quant_scale_full = tl.reshape(
-        tl.broadcast_to(tl.reshape(quant_scale, (1, NUM_QG, 1)), (1, NUM_QG, QG)),
-        (1, RS),
+    amax_u32 = amax.to(tl.uint32, bitcast=True)
+    amax_u32 = (amax_u32 + 0x200000) & 0xFF800000
+    raw_exp = (amax_u32 >> 23) & 0xFF
+    e8m0 = tl.maximum(raw_exp, 2) - 2
+    e8m0_u8 = e8m0.to(tl.uint8)
+
+    hw_scale = (e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+
+    acc_pairs = tl.reshape(acc_g, (1, NUM_QG, HALF_QG, 2))
+    even_vals, odd_vals = tl.split(acc_pairs)
+    even_flat = tl.reshape(even_vals, (1, NUM_QG * HALF_QG))
+    odd_flat = tl.reshape(odd_vals, (1, NUM_QG * HALF_QG))
+    hw_scale_broad = tl.broadcast_to(
+        tl.reshape(hw_scale, (1, NUM_QG, 1)), (1, NUM_QG, HALF_QG)
     )
-    qx = (acc * quant_scale_full).to(tl.uint32, bitcast=True)
-    s = qx & 0x80000000
-    e = (qx >> 23) & 0xFF
-    m = qx & 0x7FFFFF
-    E8_BIAS: tl.constexpr = 127
-    E2_BIAS: tl.constexpr = 1
-    adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
-    m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
-    e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
-    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
-    e2m1 = ((s >> 28) | e2m1_tmp).to(tl.uint8)
-    e2m1 = tl.reshape(e2m1, (1, RS // 2, 2))
-    even, odd = tl.split(e2m1)
-    packed = tl.reshape(even | (odd << 4), (RS // 2,))
+    scale_flat = tl.reshape(hw_scale_broad, (1, NUM_QG * HALF_QG))
+
+    packed_u32 = tl.inline_asm_elementwise(
+        asm="v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        constraints="=v,v,v,v",
+        args=[even_flat, odd_flat, scale_flat],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    packed = packed_u32.to(tl.uint8)
+    packed = tl.reshape(packed, (RS // 2,))
 
     fp4_offs_n = pid_k * (RS // 2) + tl.arange(0, RS // 2)
     tl.store(fp4_ptr + fp4_offs_n, packed)
@@ -519,28 +510,6 @@ def _fused_rot_quant_moe_sort_impl(
                 block_size,
                 int(num_valid_ids[0].item()) if num_valid_ids.numel() > 0 else -1,
             )
-            # #region agent log
-            _agent_debug_log(
-                run_id="separated-path-debug",
-                hypothesis_id="H2",
-                location="fused_rotation_mxfp4_quant_moe_sort.py:fused_rotation_mxfp4_quant_moe_sort",
-                message="Fused wrapper dispatch",
-                data={
-                    "M": int(M),
-                    "K": int(K),
-                    "RS": int(RS),
-                    "token_num": int(token_num),
-                    "topk": int(topk),
-                    "use_hip_kernel": bool(use_hip_kernel),
-                    "use_gluon_sorted_fusion": bool(use_gluon_sorted_fusion),
-                    "use_triton_decode_rot_sort": bool(use_triton_decode_rot_sort),
-                    "use_gluon_kw8": bool(use_gluon_kw8),
-                    "use_topk8_decode": bool(use_topk8_decode),
-                    "block_size": int(block_size),
-                    "valid_ids": int(num_valid_ids[0].item()) if num_valid_ids.numel() > 0 else -1,
-                },
-            )
-            # #endregion
     if use_triton_decode_rot_sort:
         n_i = K // QG
         m_o = sorted_ids.shape[0]
@@ -556,31 +525,6 @@ def _fused_rot_quant_moe_sort_impl(
             and n_i == 64
             and max_q <= 256
         )
-        if ENABLE_FUSED_MOE_DEBUG_LOG:
-            proto_key = (M, K, RS, token_num, topk, m_o, n_i, max_q)
-            if proto_key not in _TRITON_PROTO_LOG_KEYS:
-                _TRITON_PROTO_LOG_KEYS.add(proto_key)
-                # #region agent log
-                _agent_debug_log(
-                    run_id="single-kernel-prototype",
-                    hypothesis_id="H3",
-                    location="fused_rotation_mxfp4_quant_moe_sort.py:fused_rotation_mxfp4_quant_moe_sort",
-                    message="Select Triton decode single-kernel rot+quant+sort path",
-                    data={
-                        "M": int(M),
-                        "K": int(K),
-                        "RS": int(RS),
-                        "token_num": int(token_num),
-                        "topk": int(topk),
-                        "m_o": int(m_o),
-                        "m_pad": int(m_pad),
-                        "max_q": int(max_q),
-                        "n_i": int(n_i),
-                        "grid_k": int(grid[0]),
-                        "use_topk8_special": bool(use_topk8_special),
-                    },
-                )
-                # #endregion
         if use_topk8_special:
             _fused_decode_m1_topk8_k2048_kernel[grid](
                 x,
