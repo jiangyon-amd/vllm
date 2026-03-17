@@ -270,7 +270,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if self.moe_input_transform is not None:
             if self._use_fused_moe_rotation:
-                pass  # rotation handled inside rocm_aiter_fused_moe via _moe_rotation
+                pass  # rotation handled by Triton 3-in-1 kernel inside quark_moe
             else:
                 hidden_states = self.moe_input_transform(hidden_states)
 

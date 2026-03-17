@@ -751,18 +751,23 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             )
             rotation = getattr(layer, '_moe_rotation', None)
             rotation_size = getattr(layer, '_moe_rotation_size', 0)
-            out = rocm_aiter_fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=layer.activation,
-                quant_config=self.moe_quant_config,
-                expert_map=layer.expert_map,
-                rotation=rotation,
-                rotation_size=rotation_size,
-            )
+
+            if rotation is not None and rotation_size > 0:
+                out = self._apply_with_fused_rotation(
+                    layer, x, topk_weights, topk_ids,
+                    rotation, rotation_size,
+                )
+            else:
+                out = rocm_aiter_fused_experts(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=layer.activation,
+                    quant_config=self.moe_quant_config,
+                    expert_map=layer.expert_map,
+                )
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts
 
@@ -781,3 +786,79 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             )
 
         return out
+
+    def _apply_with_fused_rotation(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        rotation: torch.Tensor,
+        rotation_size: int,
+    ) -> torch.Tensor:
+        """Triton 3-in-1 (rotation+quant+sort) → CK 2-stage GEMM."""
+        import aiter
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import (
+            moe_sorting, fused_dynamic_mxfp4_quant_moe_sort, get_inter_dim,
+        )
+        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_sort import (
+            fused_rotation_mxfp4_quant_moe_sort,
+        )
+
+        M, K = x.shape
+        topk = topk_ids.shape[1]
+        E = layer.w13_weight.shape[0]
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        BLOCK_M = 32
+        QT, ACT = QuantType.per_1x32, ActivationType.Silu
+
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = \
+            moe_sorting(topk_ids, topk_weights, E, K,
+                        moebuf_dtype=x.dtype, block_size=BLOCK_M,
+                        expert_mask=layer.expert_map)
+
+        a1_fp4, a1_scale = fused_rotation_mxfp4_quant_moe_sort(
+            x, rotation, rotation_size,
+            sorted_ids=sorted_ids, num_valid_ids=num_valid_ids,
+            token_num=M, topk=topk, block_size=BLOCK_M,
+        )
+
+        def _align_scale_dtype(scale, ref_scale):
+            if scale is not None and scale.dtype != ref_scale.dtype:
+                return scale.view(ref_scale.dtype)
+            return scale
+
+        # Stage 1: CK GEMM with pre-quantized fp4 input
+        _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        _, k2, n2 = w2.shape
+        D = n2 if k2 == w1.shape[2] else n2 * 2
+        a2 = torch.empty((M, topk, D), dtype=x.dtype, device=x.device)
+
+        aiter.ck_moe_stage1_fwd(
+            a1_fp4, w1, w2,
+            sorted_ids, sorted_expert_ids, num_valid_ids,
+            a2, topk, kernelName="",
+            w1_scale=_align_scale_dtype(self.moe_quant_config.w1_scale, a1_scale),
+            a1_scale=a1_scale, block_m=BLOCK_M,
+            quant_type=QT, activation=ACT,
+        )
+
+        # Stage 2: quant stage1 output → CK GEMM
+        a2_fp4, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2.view(-1, inter_dim), sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids, token_num=M,
+            topk=topk, block_size=BLOCK_M,
+        )
+
+        aiter.ck_moe_stage2_fwd(
+            a2_fp4.view(M, topk, -1), w1, w2,
+            sorted_ids, sorted_expert_ids, num_valid_ids,
+            moe_buf, topk, kernelName="",
+            w2_scale=_align_scale_dtype(self.moe_quant_config.w2_scale, a2_scale),
+            a2_scale=a2_scale, block_m=BLOCK_M,
+            sorted_weights=sorted_weights,
+            quant_type=QT, activation=ACT,
+        )
+
+        return moe_buf
