@@ -205,13 +205,24 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             return
 
         rot_cfg = algo_list[0]
-        online_cfg = rot_cfg.get('online_config', {})
-        online_layers = online_cfg.get('online_rotation_layers', [])
+        online_cfg = rot_cfg.get('online_config') or {}
+        online_layers = online_cfg.get('online_rotation_layers')
+
+        if not online_layers and rot_cfg.get('online_r1_rotation'):
+            scaling = rot_cfg.get('scaling_layers', {})
+            online_layers_set = set()
+            for group in ('first_layer', 'middle_layers', 'last_layer'):
+                for entry in scaling.get(group, []):
+                    for mod in entry.get('next_modules', []):
+                        base = mod.replace('model.layers.layer_id.', '').replace('model.layers.pre_layer_id.', '')
+                        online_layers_set.add(base)
+            online_layers = list(online_layers_set) if online_layers_set else []
+
         if not online_layers:
             return
 
-        sample_marker = f"{prefix}.experts"
-        if not any(sample_marker in l for l in online_layers):
+        has_moe_layer = any('experts' in ol or 'mlp' in ol for ol in online_layers)
+        if not has_moe_layer:
             return
 
         rotation_size = rot_cfg.get('rotation_size', 128)
@@ -574,6 +585,17 @@ class Qwen3MoeModel(nn.Module):
         expert_params_mapping = self.get_expert_mapping()
         rotation_loaded: set[str] = set()
         for name, loaded_weight in weights:
+            # Quark 0.11 rotation format: unwrap `.linear.` wrapper and
+            # rename rotation weight suffixes
+            if ".linear.weight" in name:
+                name = name.replace(".linear.weight", ".weight")
+            if ".linear.weight_scale" in name:
+                name = name.replace(".linear.weight_scale", ".weight_scale")
+            if ".rotation_in" in name:
+                name = name.replace(".rotation_in", ".input_rotation")
+            if ".rotation_out" in name:
+                continue
+
             # Handle rotation weights (input_rotation suffix)
             if "input_rotation" in name:
                 import re
@@ -599,7 +621,12 @@ class Qwen3MoeModel(nn.Module):
                         rotation_loaded.add(rot_param_name)
                         loaded_params.add(rot_param_name)
                     continue
-                # Skip any other input_rotation weights
+                # Non-stacked rotation (e.g. o_proj.input_rotation): load directly
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
                 continue
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)

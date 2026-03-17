@@ -93,13 +93,8 @@ ENABLE_TRITON_ROT_SORT_FUSION = (
 ENABLE_GLUON_KW8 = (
     os.getenv("VLLM_MOE_GLUON_KW8", "1") == "1"
 )
-ENABLE_FUSED_MOE_DEBUG_LOG = (
-    os.getenv("VLLM_MOE_FUSED_DEBUG_LOG", "0") == "1"
-)
-
 logger = logging.getLogger(__name__)
 _DISPATCH_LOG_KEYS: set[tuple] = set()
-_TRITON_PROTO_LOG_KEYS: set[tuple] = set()
 
 
 def _pick_decode_max_q(m_pad: int) -> int:
@@ -478,38 +473,14 @@ def _fused_rot_quant_moe_sort_impl(
         and (K % RS == 0)
     )
     use_topk8_decode = topk == 8
-    if ENABLE_FUSED_MOE_DEBUG_LOG:
-        key = (
-            M,
-            K,
-            RS,
-            token_num,
-            topk,
-            use_hip_kernel,
-            use_gluon_sorted_fusion,
-            use_triton_decode_rot_sort,
-            use_gluon_kw8,
-            use_topk8_decode,
-            block_size,
+    key = (M, K, RS, token_num, topk, use_hip_kernel,
+           use_triton_decode_rot_sort, use_gluon_kw8, block_size)
+    if key not in _DISPATCH_LOG_KEYS:
+        _DISPATCH_LOG_KEYS.add(key)
+        logger.debug(
+            "fused_rot_quant_moe dispatch: M=%s K=%s hip=%s triton=%s gluon_kw8=%s topk=%s",
+            M, K, use_hip_kernel, use_triton_decode_rot_sort, use_gluon_kw8, topk,
         )
-        if key not in _DISPATCH_LOG_KEYS:
-            _DISPATCH_LOG_KEYS.add(key)
-            logger.info(
-                "fused_rotation_mxfp4_quant_moe_sort dispatch: M=%s K=%s RS=%s token_num=%s topk=%s "
-                "hip=%s gluon_sorted=%s triton_decode=%s gluon_kw8=%s topk8=%s block_size=%s valid_ids=%s",
-                M,
-                K,
-                RS,
-                token_num,
-                topk,
-                use_hip_kernel,
-                use_gluon_sorted_fusion,
-                use_triton_decode_rot_sort,
-                use_gluon_kw8,
-                use_topk8_decode,
-                block_size,
-                int(num_valid_ids[0].item()) if num_valid_ids.numel() > 0 else -1,
-            )
     if use_triton_decode_rot_sort:
         n_i = K // QG
         m_o = sorted_ids.shape[0]
