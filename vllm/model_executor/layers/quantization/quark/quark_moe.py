@@ -40,6 +40,102 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Register moe_fused_rotation_pipeline as custom op (CUDAGraph compatible)
+# ---------------------------------------------------------------------------
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _moe_fused_rotation_pipeline_impl(
+        x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+        rotation: torch.Tensor, rotation_size: int,
+        w1: torch.Tensor, w2: torch.Tensor,
+        w1_scale: torch.Tensor, w2_scale: torch.Tensor,
+        expert_map: torch.Tensor,
+    ) -> torch.Tensor:
+        import aiter
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import (
+            moe_sorting, fused_dynamic_mxfp4_quant_moe_sort, get_inter_dim,
+        )
+        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_sort import (
+            fused_rotation_mxfp4_quant_moe_sort,
+        )
+
+        M, K = x.shape
+        topk = topk_ids.shape[1]
+        E = w1.shape[0]
+        BLOCK_M = 32
+        QT, ACT = QuantType.per_1x32, ActivationType.Silu
+        emap = expert_map if expert_map.numel() > 0 else None
+        w1s = w1_scale if w1_scale.numel() > 0 else None
+        w2s = w2_scale if w2_scale.numel() > 0 else None
+
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = \
+            moe_sorting(topk_ids, topk_weights, E, K,
+                        moebuf_dtype=x.dtype, block_size=BLOCK_M,
+                        expert_mask=emap)
+
+        a1_fp4, a1_scale = fused_rotation_mxfp4_quant_moe_sort(
+            x, rotation, rotation_size,
+            sorted_ids=sorted_ids, num_valid_ids=num_valid_ids,
+            token_num=M, topk=topk, block_size=BLOCK_M,
+        )
+
+        if w1s is not None and w1s.dtype != a1_scale.dtype:
+            w1s = w1s.view(a1_scale.dtype)
+
+        _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        _, k2, n2 = w2.shape
+        D = n2 if k2 == w1.shape[2] else n2 * 2
+        a2 = torch.empty((M, topk, D), dtype=x.dtype, device=x.device)
+
+        aiter.ck_moe_stage1_fwd(
+            a1_fp4, w1, w2,
+            sorted_ids, sorted_expert_ids, num_valid_ids,
+            a2, topk, kernelName="",
+            w1_scale=w1s, a1_scale=a1_scale, block_m=BLOCK_M,
+            quant_type=QT, activation=ACT,
+        )
+
+        a2_fp4, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2.view(-1, inter_dim), sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids, token_num=M,
+            topk=topk, block_size=BLOCK_M,
+        )
+
+        if w2s is not None and w2s.dtype != a2_scale.dtype:
+            w2s = w2s.view(a2_scale.dtype)
+
+        aiter.ck_moe_stage2_fwd(
+            a2_fp4.view(M, topk, -1), w1, w2,
+            sorted_ids, sorted_expert_ids, num_valid_ids,
+            moe_buf, topk, kernelName="",
+            w2_scale=w2s, a2_scale=a2_scale, block_m=BLOCK_M,
+            sorted_weights=sorted_weights,
+            quant_type=QT, activation=ACT,
+        )
+        return moe_buf
+
+    def _moe_fused_rotation_pipeline_fake(
+        x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+        rotation: torch.Tensor, rotation_size: int,
+        w1: torch.Tensor, w2: torch.Tensor,
+        w1_scale: torch.Tensor, w2_scale: torch.Tensor,
+        expert_map: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+
+    direct_register_custom_op(
+        op_name="moe_fused_rotation_pipeline",
+        op_func=_moe_fused_rotation_pipeline_impl,
+        mutates_args=[],
+        fake_impl=_moe_fused_rotation_pipeline_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+except Exception:
+    pass
+
 __all__ = ["QuarkMoEMethod", "QuarkW8A8Fp8MoEMethod", "QuarkOCP_MX_MoEMethod"]
 
 
@@ -797,68 +893,13 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         rotation_size: int,
     ) -> torch.Tensor:
         """Triton 3-in-1 (rotation+quant+sort) → CK 2-stage GEMM."""
-        import aiter
-        from aiter import ActivationType, QuantType
-        from aiter.fused_moe import (
-            moe_sorting, fused_dynamic_mxfp4_quant_moe_sort, get_inter_dim,
+        w1_scale = self.moe_quant_config.w1_scale
+        w2_scale = self.moe_quant_config.w2_scale
+        return torch.ops.vllm.moe_fused_rotation_pipeline(
+            x, topk_weights, topk_ids,
+            rotation, rotation_size,
+            layer.w13_weight, layer.w2_weight,
+            w1_scale if w1_scale is not None else torch.empty(0),
+            w2_scale if w2_scale is not None else torch.empty(0),
+            layer.expert_map if layer.expert_map is not None else torch.empty(0, dtype=torch.int32),
         )
-        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_sort import (
-            fused_rotation_mxfp4_quant_moe_sort,
-        )
-
-        M, K = x.shape
-        topk = topk_ids.shape[1]
-        E = layer.w13_weight.shape[0]
-        w1, w2 = layer.w13_weight, layer.w2_weight
-        BLOCK_M = 32
-        QT, ACT = QuantType.per_1x32, ActivationType.Silu
-
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = \
-            moe_sorting(topk_ids, topk_weights, E, K,
-                        moebuf_dtype=x.dtype, block_size=BLOCK_M,
-                        expert_mask=layer.expert_map)
-
-        a1_fp4, a1_scale = fused_rotation_mxfp4_quant_moe_sort(
-            x, rotation, rotation_size,
-            sorted_ids=sorted_ids, num_valid_ids=num_valid_ids,
-            token_num=M, topk=topk, block_size=BLOCK_M,
-        )
-
-        def _align_scale_dtype(scale, ref_scale):
-            if scale is not None and scale.dtype != ref_scale.dtype:
-                return scale.view(ref_scale.dtype)
-            return scale
-
-        # Stage 1: CK GEMM with pre-quantized fp4 input
-        _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
-        _, k2, n2 = w2.shape
-        D = n2 if k2 == w1.shape[2] else n2 * 2
-        a2 = torch.empty((M, topk, D), dtype=x.dtype, device=x.device)
-
-        aiter.ck_moe_stage1_fwd(
-            a1_fp4, w1, w2,
-            sorted_ids, sorted_expert_ids, num_valid_ids,
-            a2, topk, kernelName="",
-            w1_scale=_align_scale_dtype(self.moe_quant_config.w1_scale, a1_scale),
-            a1_scale=a1_scale, block_m=BLOCK_M,
-            quant_type=QT, activation=ACT,
-        )
-
-        # Stage 2: quant stage1 output → CK GEMM
-        a2_fp4, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
-            a2.view(-1, inter_dim), sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids, token_num=M,
-            topk=topk, block_size=BLOCK_M,
-        )
-
-        aiter.ck_moe_stage2_fwd(
-            a2_fp4.view(M, topk, -1), w1, w2,
-            sorted_ids, sorted_expert_ids, num_valid_ids,
-            moe_buf, topk, kernelName="",
-            w2_scale=_align_scale_dtype(self.moe_quant_config.w2_scale, a2_scale),
-            a2_scale=a2_scale, block_m=BLOCK_M,
-            sorted_weights=sorted_weights,
-            quant_type=QT, activation=ACT,
-        )
-
-        return moe_buf
