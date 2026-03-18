@@ -601,8 +601,8 @@ def _fused_rot_quant_moe_sort_impl(
     if key not in _DISPATCH_LOG_KEYS:
         _DISPATCH_LOG_KEYS.add(key)
         logger.debug(
-            "fused_rot_quant_moe dispatch: M=%s K=%s hip=%s gluon_moe=%s triton=%s gluon_kw8=%s topk=%s",
-            M, K, use_hip_kernel, use_gluon_moe_decode, use_triton_decode_rot_sort, use_gluon_kw8, topk,
+            "fused_rot_quant_moe dispatch: M=%s K=%s gluon_moe=%s triton_m1=%s gluon_kw8=%s",
+            M, K, use_gluon_moe_decode, use_triton_decode_rot_sort, use_gluon_kw8,
         )
     if use_gluon_moe_decode:
         from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_gluon import (
