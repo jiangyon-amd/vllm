@@ -25,7 +25,7 @@ def _fused_rot_quant_sort_triton_kernel(
     BLOCK_M: tl.constexpr,
     N_I: tl.constexpr,
     TILE_N: tl.constexpr,
-    MAX_Q: tl.constexpr,
+    m_o_padded,
 ):
     NUM_QG: tl.constexpr = RS // QG
     HALF_QG: tl.constexpr = QG // 2
@@ -111,9 +111,9 @@ def _fused_rot_quant_sort_triton_kernel(
         e8m0_u8, mask=sc_m_mask[:, None]
     )
 
-    # Scatter sorted scales
-    for qb in tl.static_range(0, MAX_Q // BLOCK_M):
-        q = qb * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Scatter sorted scales (dynamic loop — no compile-time unroll)
+    for qb in tl.range(0, m_o_padded, BLOCK_M):
+        q = qb + tl.arange(0, BLOCK_M)
         sid = tl.load(sorted_ids_ptr + q, mask=q < num_valid, other=token_num)
         tok = sid & 0xFFFFFF
         tok_in_block = (tok >= m_base) & (tok < (m_base + BLOCK_M)) & (tok < token_num)
@@ -164,7 +164,6 @@ def fused_rot_quant_sort_triton(
     m_pad = ((m_o + 31) // 32) * 32
     tile_n = triton.cdiv(n_i, 8)
     temp_rows = ((M + 31) // 32) * 32
-    max_q = ((m_o + 31) // 32) * 32  # round up to BLOCK_M
 
     BLOCK_M = 32
 
@@ -183,7 +182,7 @@ def fused_rot_quant_sort_triton(
         fp4_out.stride(0),
         sorted_scale_out.stride(0), sorted_scale_out.stride(1),
         RS=RS, QG=QG, BLOCK_M=BLOCK_M,
-        N_I=n_i, TILE_N=tile_n, MAX_Q=max_q,
+        N_I=n_i, TILE_N=tile_n, m_o_padded=m_pad,
         num_warps=4,
     )
     from aiter.utility import dtypes
