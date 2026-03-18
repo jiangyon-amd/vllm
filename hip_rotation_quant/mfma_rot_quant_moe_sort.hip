@@ -1,5 +1,5 @@
 // MFMA Rotation + MXFP4 Quant + MoE Sorted Scale Scatter
-// v_mfma_f32_16x16x32_bf16 + v_cvt_scalef32_pk_fp4_f32
+// v_mfma_f32_16x16x32_bf16 + v_cvt_scalef32_pk_fp4_f32 + ds_read_tr16_b64
 // Target: MI355X (gfx950, CDNA4)
 //
 // MFMA 16x16x32 BF16 layout:
@@ -7,9 +7,13 @@
 //   B: lane%16 = N-col,  lane/16 = k_group, 8 bf16 per lane
 //   C: lane%16 = col,    row = (lane/16)*4 + i (i=0..3)
 //
+// ds_read_b64_tr_b16: 4×16 transpose for every 16 lanes
+//   Per-lane address: lane i → &block[i/4][(i%4)*4]
+//   Row stride = 16 bf16 = 32 bytes. Pre-tile R to [8][128][16].
+//
 // Wave tiling: 2x2 waves (256 threads)
-//   wave_m = wave_id/2 (0,1) -> 16 rows each -> 32 rows total
-//   wave_n = wave_id%2 (0,1) -> 64 cols each -> 128 cols total
+//   wave_m = wave_id/2 (0,1) → 16 rows each → 32 rows total
+//   wave_n = wave_id%2 (0,1) → 64 cols each → 128 cols total
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -20,6 +24,7 @@ constexpr int NUM_QG = RS / QG;   // 4
 constexpr int BLOCK_M = 32;
 constexpr int THREADS = 256;
 constexpr int TILE_W = 16;
+constexpr int N_TILES = RS / TILE_W; // 8
 
 using float4_t = __attribute__((ext_vector_type(4))) float;
 using bf16x4_t = __attribute__((ext_vector_type(4))) __bf16;
@@ -47,25 +52,27 @@ void mfma_rot_quant_moe_sort_kernel(
     const int k_group = lane / 16;
     const int lane16 = lane % 16;
 
-    // ---- Load rotation matrix to LDS ----
-    // Simple row-major layout: R_lds[k][n] = rotation[k * RS + n]
-    __shared__ __bf16 R_lds[RS][RS]; // 128 x 128 x 2B = 32KB
+    // ---- Pre-tile rotation matrix for ds_read_tr ----
+    // Row stride = 16 bf16 = 32 bytes (matches ds_read_tr requirement)
+    __shared__ __bf16 R_tiled[N_TILES][RS][TILE_W]; // 8 × 128 × 16 × 2B = 32KB
 
     for (int i = tid; i < RS * RS; i += THREADS) {
         int k = i / RS;
         int n = i % RS;
-        R_lds[k][n] = rotation[k * RS + n];
+        R_tiled[n / TILE_W][k][n % TILE_W] = rotation[k * RS + n];
     }
 
     __shared__ uint8_t scale_lds[BLOCK_M][NUM_QG];
     __syncthreads();
 
-    // ---- MFMA rotation matmul with scalar B loading ----
-    // MFMA B operand: lane16 = N-column, k_group = which 8 K elements
-    // b_data[j] = R[k_start + k_group*8 + j][n_col_base + lane16] for j = 0..7
+    // ---- MFMA rotation matmul with ds_read_tr B loading ----
     const int a_row = row_start + wave_m * 16 + lane16;
     const int n_base = wave_n * 64;
     float4_t acc[4] = {};
+
+    // ds_read_tr per-lane address components (within 16-lane group)
+    const int tr_row = lane16 / 4;     // 0..3: which of the 4 K rows
+    const int tr_col4 = (lane16 % 4) * 4; // 0,4,8,12: which 4-col segment
 
     #pragma unroll
     for (int kt = 0; kt < 4; kt++) {
@@ -80,25 +87,34 @@ void mfma_rot_quant_moe_sort_kernel(
 
         #pragma unroll
         for (int nt = 0; nt < 4; nt++) {
-            const int n_col = n_base + nt * TILE_W + lane16;
+            const int n_tile = n_base / TILE_W + nt;
 
-            // Scalar B loading: read 8 consecutive K values from column n_col
+            // ds_read_tr: per-lane addr = &R_tiled[n_tile][k_off + lane16/4][(lane16%4)*4]
+            // Reads 4×16 block, transposes to give lane l column l from 4 rows
+            auto* b_ptr0 = reinterpret_cast<__attribute__((address_space(3))) bf16x4_t*>(
+                reinterpret_cast<uintptr_t>(&R_tiled[n_tile][k_off + tr_row][tr_col4]));
+            bf16x4_t b_lo = __builtin_amdgcn_ds_read_tr16_b64_v4bf16(b_ptr0);
+
+            auto* b_ptr1 = reinterpret_cast<__attribute__((address_space(3))) bf16x4_t*>(
+                reinterpret_cast<uintptr_t>(&R_tiled[n_tile][k_off + 4 + tr_row][tr_col4]));
+            bf16x4_t b_hi = __builtin_amdgcn_ds_read_tr16_b64_v4bf16(b_ptr1);
+
             bf16x8_t b_data;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                b_data[j] = R_lds[k_off + j][n_col];
-            }
+            b_data[0] = b_lo[0]; b_data[1] = b_lo[1];
+            b_data[2] = b_lo[2]; b_data[3] = b_lo[3];
+            b_data[4] = b_hi[0]; b_data[5] = b_hi[1];
+            b_data[6] = b_hi[2]; b_data[7] = b_hi[3];
 
-            acc[nt] = __builtin_amdgcn_mfma_f32_16x16x32_bf16(a_data, b_data, acc[nt], 0, 0, 0);
+            acc[nt] = __builtin_amdgcn_mfma_f32_16x16x32_bf16(
+                a_data, b_data, acc[nt], 0, 0, 0);
         }
     }
 
-    // ---- MXFP4 quantization ----
-    // Output layout: acc[nt][i] -> result[wave_m*16 + (lane/16)*4 + i, n_base + nt*16 + lane16]
+    // ---- Quantize + store FP4 + e8m0 to LDS ----
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        int row_local = wave_m * 16 + (lane / 16) * 4 + i;
-        int global_row = row_start + row_local;
+        const int row_local = wave_m * 16 + k_group * 4 + i;
+        const int global_row = row_start + row_local;
         if (global_row >= M) continue;
 
         #pragma unroll
