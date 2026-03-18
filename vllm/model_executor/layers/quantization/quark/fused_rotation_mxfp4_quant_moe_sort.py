@@ -727,6 +727,15 @@ def _fused_rot_quant_moe_sort_impl(
             token_num=token_num,
         )
         sorted_scale = sorted_u8[:, :n_scales].view(dtypes.fp8_e8m0)
+    elif use_gluon_kw8 and topk in (1, 8):
+        from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_sort_gluon_kw8 import (
+            fused_rot_quant_sort_kw8,
+        )
+        return fused_rot_quant_sort_kw8(
+            x, rotation, RS,
+            sorted_ids, num_valid_ids, token_num, topk,
+            block_size=block_size,
+        )
     else:
         fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
         raw_scale = torch.empty((M, K // QG), dtype=torch.uint8, device=x.device)
@@ -736,28 +745,20 @@ def _fused_rot_quant_moe_sort_impl(
             )
 
             fp4_u8, raw_scale = fused_rotation_quant_hip(
-                x,
-                rotation,
-                RS,
-                fp4_out=fp4_u8,
-                scales_out=raw_scale,
-                shuffle_scales=False,
+                x, rotation, RS,
+                fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False,
+            )
+        elif use_gluon_kw8:
+            fp4_u8, raw_scale = fused_gluon_v2_kw8(
+                x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
             )
         else:
-            if use_gluon_kw8:
-                fp4_u8, raw_scale = fused_gluon_v2_kw8(
-                    x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
-                )
-            else:
-                fp4_u8, raw_scale = fused_gluon_v2(
-                    x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
-                )
+            fp4_u8, raw_scale = fused_gluon_v2(
+                x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
+            )
         sorted_scale = moe_mxfp4_sort(
-            raw_scale,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=block_size,
+            raw_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids,
+            token_num=token_num, block_size=block_size,
         )
 
     return fp4_u8.view(dtypes.fp4x2), sorted_scale
