@@ -727,15 +727,6 @@ def _fused_rot_quant_moe_sort_impl(
             token_num=token_num,
         )
         sorted_scale = sorted_u8[:, :n_scales].view(dtypes.fp8_e8m0)
-    elif use_gluon_kw8 and topk in (1, 8):
-        from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_sort_gluon_kw8 import (
-            fused_rot_quant_sort_kw8,
-        )
-        return fused_rot_quant_sort_kw8(
-            x, rotation, RS,
-            sorted_ids, num_valid_ids, token_num, topk,
-            block_size=block_size,
-        )
     else:
         fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
         raw_scale = torch.empty((M, K // QG), dtype=torch.uint8, device=x.device)
