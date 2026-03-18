@@ -8,8 +8,8 @@
 //   C: lane%16 = col,    row = (lane/16)*4 + i (i=0..3)
 //
 // Wave tiling: 2x2 waves (256 threads)
-//   wave_m = wave_id/2 (0,1) → 16 rows each → 32 rows total
-//   wave_n = wave_id%2 (0,1) → 64 cols each → 128 cols total
+//   wave_m = wave_id/2 (0,1) -> 16 rows each -> 32 rows total
+//   wave_n = wave_id%2 (0,1) -> 64 cols each -> 128 cols total
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -19,8 +19,10 @@ constexpr int QG = 32;
 constexpr int NUM_QG = RS / QG;   // 4
 constexpr int BLOCK_M = 32;
 constexpr int THREADS = 256;
+constexpr int TILE_W = 16;
 
 using float4_t = __attribute__((ext_vector_type(4))) float;
+using bf16x4_t = __attribute__((ext_vector_type(4))) __bf16;
 using bf16x8_t = __attribute__((ext_vector_type(8))) __bf16;
 
 template <int N_I, int TILE_N>
@@ -46,14 +48,21 @@ void mfma_rot_quant_moe_sort_kernel(
     const int lane16 = lane % 16;
 
     // ---- Load rotation matrix to LDS ----
-    __shared__ __bf16 R_lds[RS][RS];
-    for (int i = tid; i < RS * RS; i += THREADS)
-        R_lds[i / RS][i % RS] = rotation[i];
+    // Simple row-major layout: R_lds[k][n] = rotation[k * RS + n]
+    __shared__ __bf16 R_lds[RS][RS]; // 128 x 128 x 2B = 32KB
+
+    for (int i = tid; i < RS * RS; i += THREADS) {
+        int k = i / RS;
+        int n = i % RS;
+        R_lds[k][n] = rotation[k * RS + n];
+    }
 
     __shared__ uint8_t scale_lds[BLOCK_M][NUM_QG];
     __syncthreads();
 
-    // ---- MFMA rotation matmul ----
+    // ---- MFMA rotation matmul with scalar B loading ----
+    // MFMA B operand: lane16 = N-column, k_group = which 8 K elements
+    // b_data[j] = R[k_start + k_group*8 + j][n_col_base + lane16] for j = 0..7
     const int a_row = row_start + wave_m * 16 + lane16;
     const int n_base = wave_n * 64;
     float4_t acc[4] = {};
@@ -61,31 +70,35 @@ void mfma_rot_quant_moe_sort_kernel(
     #pragma unroll
     for (int kt = 0; kt < 4; kt++) {
         const int k_start = kt * 32;
+        const int k_off = k_start + k_group * 8;
 
         bf16x8_t a_data = {};
         if (a_row < M) {
-            auto* a_ptr = x + a_row * stride_x + col_start + k_start + k_group * 8;
+            auto* a_ptr = x + a_row * stride_x + col_start + k_off;
             a_data = *reinterpret_cast<const bf16x8_t*>(a_ptr);
         }
 
         #pragma unroll
         for (int nt = 0; nt < 4; nt++) {
-            const int n_col = n_base + nt * 16;
+            const int n_col = n_base + nt * TILE_W + lane16;
+
+            // Scalar B loading: read 8 consecutive K values from column n_col
             bf16x8_t b_data;
             #pragma unroll
-            for (int j = 0; j < 8; j++)
-                b_data[j] = R_lds[k_start + k_group * 8 + j][n_col + lane16];
+            for (int j = 0; j < 8; j++) {
+                b_data[j] = R_lds[k_off + j][n_col];
+            }
 
-            acc[nt] = __builtin_amdgcn_mfma_f32_16x16x32_bf16(
-                a_data, b_data, acc[nt], 0, 0, 0);
+            acc[nt] = __builtin_amdgcn_mfma_f32_16x16x32_bf16(a_data, b_data, acc[nt], 0, 0, 0);
         }
     }
 
-    // ---- Quantize + store FP4 + e8m0 to LDS ----
+    // ---- MXFP4 quantization ----
+    // Output layout: acc[nt][i] -> result[wave_m*16 + (lane/16)*4 + i, n_base + nt*16 + lane16]
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        const int row_local = wave_m * 16 + k_group * 4 + i;
-        const int global_row = row_start + row_local;
+        int row_local = wave_m * 16 + (lane / 16) * 4 + i;
+        int global_row = row_start + row_local;
         if (global_row >= M) continue;
 
         #pragma unroll
@@ -93,21 +106,18 @@ void mfma_rot_quant_moe_sort_kernel(
             float v0 = acc[qg * 2][i];
             float v1 = acc[qg * 2 + 1][i];
 
-            // Warp amax reduction (16 lanes)
             float amax = fmaxf(fabsf(v0), fabsf(v1));
             amax = fmaxf(amax, __shfl_xor(amax, 1));
             amax = fmaxf(amax, __shfl_xor(amax, 2));
             amax = fmaxf(amax, __shfl_xor(amax, 4));
             amax = fmaxf(amax, __shfl_xor(amax, 8));
 
-            // E8M0 scale
             uint32_t u32 = __float_as_uint(amax);
             u32 = (u32 + 0x200000) & 0xFF800000;
             uint32_t raw_exp = (u32 >> 23) & 0xFF;
             uint32_t e8m0 = max(raw_exp, 2u) - 2u;
             float hw_scale = __uint_as_float(e8m0 << 23);
 
-            // FP4 pack: even lane packs (even, odd) pair
             const int out_base = global_row * stride_fp4 + blockIdx.y * (RS / 2);
 
             float odd0 = __shfl(v0, lane | 1);
