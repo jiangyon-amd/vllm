@@ -87,6 +87,9 @@ ENABLE_GLUON_SORTED_SCALE_FUSION = (
 ENABLE_HIP_FUSED_ROTATION = (
     os.getenv("VLLM_MOE_HIP_FUSED_ROTATION", "0") == "1"
 )
+ENABLE_HIP_MFMA = (
+    os.getenv("VLLM_MOE_HIP_MFMA", "0") == "1"
+)
 ENABLE_TRITON_ROT_SORT_FUSION = (
     os.getenv("VLLM_MOE_TRITON_ROT_SORT_FUSION", "0") == "1"
 )
@@ -555,6 +558,22 @@ def _fused_rot_quant_moe_sort_impl(
         use_hip_kernel = ENABLE_HIP_FUSED_ROTATION
     if use_triton_rot_sort_kernel is None:
         use_triton_rot_sort_kernel = ENABLE_TRITON_ROT_SORT_FUSION
+
+    # HIP MFMA 3-in-1: single kernel for all M, ~12-15µs
+    if ENABLE_HIP_MFMA and RS == 128 and (K % RS == 0):
+        from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_mfma_hip import (
+            fused_mfma_rot_quant_moe_sort, is_available,
+        )
+        if is_available():
+            key = ("hip_mfma", M, K, RS, token_num, topk, block_size)
+            if key not in _DISPATCH_LOG_KEYS:
+                _DISPATCH_LOG_KEYS.add(key)
+                logger.info("fused_rot_quant_moe dispatch: HIP MFMA 3-in-1 M=%s K=%s", M, K)
+            return fused_mfma_rot_quant_moe_sort(
+                x, rotation, RS,
+                sorted_ids, num_valid_ids,
+                token_num, topk, block_size,
+            )
 
     # Keep this experimental path opt-in until it beats gluon+moe_mxfp4_sort
     # in end-to-end measurements.
