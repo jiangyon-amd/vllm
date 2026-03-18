@@ -88,7 +88,10 @@ ENABLE_HIP_FUSED_ROTATION = (
     os.getenv("VLLM_MOE_HIP_FUSED_ROTATION", "0") == "1"
 )
 ENABLE_TRITON_ROT_SORT_FUSION = (
-    os.getenv("VLLM_MOE_TRITON_ROT_SORT_FUSION", "1") == "1"
+    os.getenv("VLLM_MOE_TRITON_ROT_SORT_FUSION", "0") == "1"
+)
+ENABLE_GLUON_MOE_DECODE = (
+    os.getenv("VLLM_MOE_GLUON_DECODE", "1") == "1"
 )
 ENABLE_GLUON_KW8 = (
     os.getenv("VLLM_MOE_GLUON_KW8", "1") == "1"
@@ -565,10 +568,21 @@ def _fused_rot_quant_moe_sort_impl(
     # so it should not enter gluon single-kernel sorted-scale fusion branch.
     if use_hip_kernel:
         use_gluon_sorted_fusion = False
+    use_gluon_moe_decode = (
+        ENABLE_GLUON_MOE_DECODE
+        and (not use_hip_kernel)
+        and (not use_gluon_sorted_fusion)
+        and M == 1
+        and token_num == 1
+        and topk in (1, 8)
+        and RS == 128
+        and (K % RS == 0)
+    )
     use_triton_decode_rot_sort = (
         use_triton_rot_sort_kernel
         and (not use_hip_kernel)
         and (not use_gluon_sorted_fusion)
+        and (not use_gluon_moe_decode)
         and M == 1
         and token_num == 1
         and topk in (1, 8)
@@ -577,19 +591,36 @@ def _fused_rot_quant_moe_sort_impl(
         ENABLE_GLUON_KW8
         and (not use_hip_kernel)
         and (not use_gluon_sorted_fusion)
+        and (not use_gluon_moe_decode)
         and (not use_triton_decode_rot_sort)
         and RS == 128
         and (K % RS == 0)
     )
-    use_topk8_decode = topk == 8
     key = (M, K, RS, token_num, topk, use_hip_kernel,
-           use_triton_decode_rot_sort, use_gluon_kw8, block_size)
+           use_gluon_moe_decode, use_triton_decode_rot_sort, use_gluon_kw8, block_size)
     if key not in _DISPATCH_LOG_KEYS:
         _DISPATCH_LOG_KEYS.add(key)
         logger.debug(
-            "fused_rot_quant_moe dispatch: M=%s K=%s hip=%s triton=%s gluon_kw8=%s topk=%s",
-            M, K, use_hip_kernel, use_triton_decode_rot_sort, use_gluon_kw8, topk,
+            "fused_rot_quant_moe dispatch: M=%s K=%s hip=%s gluon_moe=%s triton=%s gluon_kw8=%s topk=%s",
+            M, K, use_hip_kernel, use_gluon_moe_decode, use_triton_decode_rot_sort, use_gluon_kw8, topk,
         )
+    if use_gluon_moe_decode:
+        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_gluon import (
+            fused_decode_m1_rot_quant_sorted_gluon,
+        )
+        n_i = K // QG
+        m_o = sorted_ids.shape[0]
+        m_pad = ((m_o + 31) // 32) * 32
+        fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+        sorted_u8 = torch.empty((m_pad + 1, n_i), dtype=torch.uint8, device=x.device)
+        fused_decode_m1_rot_quant_sorted_gluon(
+            x, rotation, fp4_u8,
+            sorted_ids, num_valid_ids, sorted_u8,
+            K=K, RS=RS, QG=QG, n_i=n_i,
+            token_num=token_num, m_o=m_o, m_pad=m_pad,
+        )
+        return fp4_u8.view(dtypes.fp4x2), sorted_u8[:m_pad].view(dtypes.fp8_e8m0)
+
     if use_triton_decode_rot_sort:
         n_i = K // QG
         m_o = sorted_ids.shape[0]
@@ -629,7 +660,7 @@ def _fused_rot_quant_moe_sort_impl(
                 token_num=token_num,
                 m_o=m_o,
                 MAX_Q=max_q,
-                num_warps=4,
+                num_warps=1,
             )
         elif use_topk8_general:
             _fused_decode_m1_topk8_general_kernel[grid](
@@ -651,7 +682,7 @@ def _fused_rot_quant_moe_sort_impl(
                 N_I=n_i,
                 TILE_N=triton.cdiv(n_i, 8),
                 MAX_Q=max_q,
-                num_warps=4,
+                num_warps=1,
             )
         else:
             _fused_decode_m1_rot_quant_sorted_kernel[grid](

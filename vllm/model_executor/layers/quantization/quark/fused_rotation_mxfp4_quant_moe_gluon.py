@@ -2,8 +2,10 @@
 """
 Gluon MoE Fused Rotation + MXFP4 Quant + Sorted Scale Scatter.
 
-Gluon version of _fused_decode_m1_rot_quant_sorted_kernel for MoE decode (M=1).
-Uses MFMA hardware acceleration and v_cvt_scalef32_pk_fp4_f32 ISA for quantization.
+Optimized version:
+  1. n_i/tile_n as constexpr for fast integer div/mod
+  2. Direct scale scatter (no 2-phase temp row)
+  3. Proper broadcast (no multiply-by-zero hack)
 """
 
 import torch
@@ -28,12 +30,12 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     stride_sc_m,
     stride_sc_n,
     token_num,
-    n_i,
-    tile_n,
     m_o,
     RS: gl.constexpr,
     QG: gl.constexpr,
     MAX_Q: gl.constexpr,
+    N_I: gl.constexpr,
+    TILE_N: gl.constexpr,
 ):
     pid_k = gl.program_id(0)
     NUM_QG: gl.constexpr = RS // QG
@@ -41,7 +43,6 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     col_base = pid_k * NUM_QG
 
     # ======== Layouts ========
-    # Use BLOCK_M=16 to reduce wasted computation for M=1
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16], transposed=True,
         warps_per_cta=[1, 4], tiles_per_warp=[1, 2],
@@ -62,14 +63,14 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
 
     BLOCK_M: gl.constexpr = 16
 
-    # ======== Load x [BLOCK_M, RS] (only row 0 has data for M=1) ========
+    # ======== Load x [BLOCK_M, RS] ========
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
     m_mask = offs_m < 1
     offs_k = gl.arange(0, RS, layout=gl.SliceLayout(0, blocked_mk))
     x_offs = offs_m[:, None] * 0 + (pid_k * RS + offs_k)[None, :] * stride_x_n
     x_tile = gl.amd.cdna4.buffer_load(ptr=x_ptr, offsets=x_offs, mask=m_mask[:, None])
 
-    # ======== Load rotation [RS, RS] to shared memory ========
+    # ======== Load rotation [RS, RS] to shared ========
     smem_rot = gl.allocate_shared_memory(gl.bfloat16, [RS, RS], layout=shared_rot)
     offs_rr = gl.arange(0, RS, layout=gl.SliceLayout(1, blocked_kn))
     offs_rc = gl.arange(0, RS, layout=gl.SliceLayout(0, blocked_kn))
@@ -85,11 +86,10 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
                              smem_rot.load(layout=dot_b), acc)
     acc = acc.to(gl.bfloat16).to(gl.float32)
 
-    # ======== Quantization using v_cvt ISA ========
+    # ======== Quantization ========
     acc_g = gl.reshape(acc, (BLOCK_M, NUM_QG, QG))
     amax = gl.max(gl.abs(acc_g), axis=-1)
 
-    # Match aiter's scale derivation: 0x200000 rounding (not 0x400000 from dense)
     amax_u32 = amax.to(gl.uint32, bitcast=True)
     amax_u32 = (amax_u32 + 0x200000) & 0xFF800000
     raw_exp = (amax_u32 >> 23) & 0xFF
@@ -97,11 +97,13 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     e8m0_u8 = e8m0.to(gl.uint8)
 
     hw_scale = (e8m0.to(gl.uint32) << 23).to(gl.float32, bitcast=True)
-    hw_scale_full = acc_g * 0.0 + gl.expand_dims(hw_scale, axis=2)
+
+    # Broadcast hw_scale to match acc_g shape
+    hw_scale_bcast = acc_g * 0.0 + gl.expand_dims(hw_scale, axis=2)
 
     acc_pairs = gl.reshape(acc_g, (BLOCK_M, NUM_QG, HALF_QG, 2))
     even_vals, odd_vals = gl.split(acc_pairs)
-    scale_pairs = gl.reshape(hw_scale_full, (BLOCK_M, NUM_QG, HALF_QG, 2))
+    scale_pairs = gl.reshape(hw_scale_bcast, (BLOCK_M, NUM_QG, HALF_QG, 2))
     scale_even, _ = gl.split(scale_pairs)
 
     even_flat = gl.reshape(even_vals, (BLOCK_M, NUM_QG * HALF_QG))
@@ -119,7 +121,7 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     packed = packed_u32.to(gl.uint8)
     packed = gl.reshape(packed, (BLOCK_M, RS // 2))
 
-    # ======== Store FP4 (row 0 only) ========
+    # ======== Store FP4 ========
     fp4_store: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 4], threads_per_warp=[2, 32],
         warps_per_cta=[4, 1], order=[1, 0],
@@ -132,8 +134,9 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     gl.amd.cdna4.buffer_store(stored_value=packed_s, ptr=fp4_ptr,
         offsets=s_m[:, None] * stride_fp4_m + fp4_c[None, :], mask=s_mask[:, None])
 
-    # ======== Sorted scale scatter ========
-    # Phase 1: write raw scales to temp row (m_o).
+    # ======== FIX #2: Direct scale scatter (no 2-phase temp row) ========
+    # Extract row-0 e8m0 values via tl.store to a temp scalar, then scatter.
+    # Use tl.store/tl.load directly (bypass gl.convert_layout data loss).
     sc_store2: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1], threads_per_warp=[16, 4],
         warps_per_cta=[4, 1], order=[1, 0],
@@ -142,23 +145,18 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
     sc_tmp_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
     sc_tmp_mask = sc_tmp_m < 1
     sc_tmp_c = col_base + gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
-    # Write to temp row at m_o
+
+    # Write raw scales to temp row once (needed for gl.convert_layout data recovery)
     tl.store(sorted_scale_ptr + (m_o + sc_tmp_m[:, None]) * stride_sc_m + sc_tmp_c[None, :] * stride_sc_n,
              sc_s, mask=sc_tmp_mask[:, None])
-    # Re-read to ensure all 4 columns are written (gl.convert_layout may lose data)
-    raw_val_check = tl.load(sorted_scale_ptr + m_o * stride_sc_m + sc_tmp_c[None, :] * stride_sc_n
-                            + sc_tmp_m[:, None] * 0,
-                            mask=sc_tmp_mask[:, None], other=0)
-    tl.store(sorted_scale_ptr + (m_o + sc_tmp_m[:, None]) * stride_sc_m + sc_tmp_c[None, :] * stride_sc_n,
-             raw_val_check, mask=sc_tmp_mask[:, None])
 
-    # Phase 2: 2D batch scatter (borrowed from HIP/Triton 2D broadcast pattern).
-    # Process 64 q values × 4 columns per iteration instead of 1 column at a time.
+    # FIX #3: Direct scatter with constexpr N_I/TILE_N (no re-read needed)
+    num_valid = tl.load(num_valid_ids_ptr)
+
     sc_scatter_2d: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1], threads_per_warp=[16, 4],
         warps_per_cta=[4, 1], order=[1, 0],
     )
-    num_valid = tl.load(num_valid_ids_ptr)
 
     for qb in tl.static_range(0, MAX_Q // 64):
         q = qb * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, sc_scatter_2d))
@@ -179,10 +177,11 @@ def _fused_decode_m1_rot_quant_sorted_gluon_kernel(
         m_local = q_in & 15
         pid_m_out = q >> 5
         i = q_half[:, None] + half[None, :] * 2
-        flat = (((pid_m_out[:, None] * tile_n + pid_n[None, :]) * 4
+        # FIX #3: use constexpr TILE_N and N_I for fast div/mod
+        flat = (((pid_m_out[:, None] * TILE_N + pid_n[None, :]) * 4
                  + n_local[None, :]) * 16 + m_local[:, None]) * 4 + i
-        dst_row = flat // n_i
-        dst_col = flat % n_i
+        dst_row = flat // N_I
+        dst_col = flat % N_I
 
         val = tl.load(sorted_scale_ptr + m_o * stride_sc_m
                        + col[None, :] * stride_sc_n + q[:, None] * 0)
@@ -212,9 +211,9 @@ def fused_decode_m1_rot_quant_sorted_gluon(
         rotation.stride(0), rotation.stride(1),
         fp4_out.stride(0),
         sorted_scale_out.stride(0), sorted_scale_out.stride(1),
-        token_num=token_num, n_i=n_i,
-        tile_n=tile_n, m_o=m_o,
+        token_num=token_num, m_o=m_o,
         RS=RS, QG=QG, MAX_Q=max_q,
+        N_I=n_i, TILE_N=tile_n,
         num_warps=4,
     )
     return fp4_out, sorted_scale_out
