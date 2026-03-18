@@ -734,7 +734,6 @@ def _fused_rot_quant_moe_sort_impl(
             from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_hip import (
                 fused_rotation_quant_hip,
             )
-
             fp4_u8, raw_scale = fused_rotation_quant_hip(
                 x, rotation, RS,
                 fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False,
