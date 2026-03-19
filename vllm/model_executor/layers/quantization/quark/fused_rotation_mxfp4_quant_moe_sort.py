@@ -559,21 +559,23 @@ def _fused_rot_quant_moe_sort_impl(
     if use_triton_rot_sort_kernel is None:
         use_triton_rot_sort_kernel = ENABLE_TRITON_ROT_SORT_FUSION
 
-    # HIP MFMA 3-in-1: single kernel for all M, ~12-15µs
+    # HIP MFMA 3-in-1: single kernel for all M via aiter torch op
     if ENABLE_HIP_MFMA and RS == 128 and (K % RS == 0):
-        from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_mfma_hip import (
-            fused_mfma_rot_quant_moe_sort, is_available,
-        )
-        if is_available():
+        try:
+            from aiter.ops.mfma_rot_quant_moe_sort import mfma_rot_quant_moe_sort as _aiter_mfma
+            n_i = K // QG
+            m_o = sorted_ids.shape[0]
+            m_pad = ((m_o + block_size - 1) // block_size) * block_size
+            fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+            sc_u8 = torch.zeros((m_pad, n_i), dtype=torch.uint8, device=x.device)
             key = ("hip_mfma", M, K, RS, token_num, topk, block_size)
             if key not in _DISPATCH_LOG_KEYS:
                 _DISPATCH_LOG_KEYS.add(key)
-                logger.info("fused_rot_quant_moe dispatch: HIP MFMA 3-in-1 M=%s K=%s", M, K)
-            return fused_mfma_rot_quant_moe_sort(
-                x, rotation, RS,
-                sorted_ids, num_valid_ids,
-                token_num, topk, block_size,
-            )
+                logger.info("fused_rot_quant_moe dispatch: HIP MFMA 3-in-1 (aiter) M=%s K=%s", M, K)
+            _aiter_mfma(x, rotation, fp4_u8, sc_u8, sorted_ids, num_valid_ids, token_num, RS)
+            return fp4_u8.view(dtypes.fp4x2), sc_u8.view(dtypes.fp8_e8m0)
+        except Exception as e:
+            logger.warning("HIP MFMA kernel unavailable, falling back: %s", e)
 
     # Keep this experimental path opt-in until it beats gluon+moe_mxfp4_sort
     # in end-to-end measurements.
