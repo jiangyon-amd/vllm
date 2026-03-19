@@ -13,6 +13,9 @@ from triton import language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+if not (hasattr(gl, 'amd') and hasattr(gl.amd, 'cdna4')):
+    raise ImportError("Gluon cdna4 not available (requires Triton 3.5.x)")
+
 
 @gluon.jit
 def _fused_rot_quant_v2_kw8(

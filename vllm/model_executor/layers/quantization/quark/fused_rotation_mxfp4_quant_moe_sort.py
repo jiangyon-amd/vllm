@@ -14,12 +14,13 @@ import triton
 import triton.language as tl
 from aiter.utility import dtypes
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon_v2 import (
-    fused_gluon_v2,
-)
-from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon_v2_kw8 import (
-    fused_gluon_v2_kw8,
-)
+def _import_gluon_v2():
+    from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon_v2 import fused_gluon_v2
+    return fused_gluon_v2
+
+def _import_gluon_v2_kw8():
+    from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon_v2_kw8 import fused_gluon_v2_kw8
+    return fused_gluon_v2_kw8
 
 # ---------------------------------------------------------------------------
 # Register fused_rotation_mxfp4_quant_moe_sort as a custom op so that
@@ -736,7 +737,7 @@ def _fused_rot_quant_moe_sort_impl(
         m_pad = ((sorted_ids.shape[0] + 31) // 32) * 32
         fp4_u8 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
         sorted_u8 = torch.empty((m_pad, sn_padded), dtype=torch.uint8, device=x.device)
-        fp4_u8, sorted_u8 = fused_gluon_v2(
+        fp4_u8, sorted_u8 = _import_gluon_v2()(
             x,
             rotation,
             RS,
@@ -760,11 +761,11 @@ def _fused_rot_quant_moe_sort_impl(
                 fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False,
             )
         elif use_gluon_kw8:
-            fp4_u8, raw_scale = fused_gluon_v2_kw8(
+            fp4_u8, raw_scale = _import_gluon_v2_kw8()(
                 x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
             )
         else:
-            fp4_u8, raw_scale = fused_gluon_v2(
+            fp4_u8, raw_scale = _import_gluon_v2()(
                 x, rotation, RS, fp4_out=fp4_u8, scales_out=raw_scale, shuffle_scales=False
             )
         sorted_scale = moe_mxfp4_sort(
