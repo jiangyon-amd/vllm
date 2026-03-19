@@ -10,6 +10,24 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def build_hadamard_matrix(
+    size: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.int8,
+) -> torch.Tensor:
+    """Build Sylvester Hadamard matrix of size (size, size). size must be a power of 2.
+    Values are +1 and -1. Used when Quark export does not include the Hadamard matrix."""
+    if size <= 0 or (size & (size - 1)) != 0:
+        raise ValueError("Hadamard size must be a positive power of 2")
+    h = torch.tensor([[1]], device=device, dtype=torch.int8)
+    h2 = torch.tensor([[1, 1], [1, -1]], device=device, dtype=torch.int8)
+    while h.shape[0] < size:
+        h = torch.kron(h2, h)
+    if h.shape[0] > size:
+        raise ValueError("size must be power of 2")
+    return h.to(dtype)
+
+
 class OrthogonalTransform(torch.nn.Module):
     def __init__(
         self,
@@ -48,12 +66,23 @@ class OrthogonalTransform(torch.nn.Module):
         ):
             rotation_config = quant_config["algo_config"][0]
 
-            online_rotation_layers = rotation_config["online_config"][
-                "online_rotation_layers"
-            ]
+            online_config = rotation_config.get("online_config") or {}
+            online_rotation_layers = online_config.get("online_rotation_layers")
+
+            # Quark 0.11 Hadamard format: online_config is null, infer from
+            # online_r1_rotation flag and scaling_layers structure.
+            if not online_rotation_layers and rotation_config.get("online_r1_rotation"):
+                scaling = rotation_config.get("scaling_layers", {})
+                online_rotation_layers = set()
+                for group in ("first_layer", "middle_layers", "last_layer"):
+                    for entry in scaling.get(group, []):
+                        for mod in entry.get("next_modules", []):
+                            base = mod.replace("model.layers.layer_id.", "").replace("model.layers.pre_layer_id.", "")
+                            online_rotation_layers.add(base)
+                online_rotation_layers = list(online_rotation_layers) if online_rotation_layers else None
 
             if online_rotation_layers is not None and any(
-                layer_name in online_rotation_layers for layer_name in layer_names
+                any(ol in layer_name for ol in online_rotation_layers) for layer_name in layer_names
             ):
                 use_online_rotation = True
                 rotation_size = rotation_config["rotation_size"]
@@ -86,5 +115,11 @@ def rotation_weight_loader(
     expert_id: int | None = None,
 ):
     assert param.shape == loaded_weight.shape
-    assert param.dtype == loaded_weight.dtype
+    # Handle dtype conversion: Quark may export bool, vLLM expects int8/float64
+    if param.dtype != loaded_weight.dtype:
+        # Hadamard export uses bool; vLLM expects int8 with True->1, False->-1
+        if loaded_weight.dtype == torch.bool and param.dtype == torch.int8:
+            loaded_weight = torch.where(loaded_weight, 1, -1).to(torch.int8)
+        else:
+            loaded_weight = loaded_weight.to(param.dtype)
     param.data.copy_(loaded_weight)

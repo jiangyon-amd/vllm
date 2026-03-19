@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from fractions import Fraction
+import os
 from functools import cache, partial
 from typing import Any
 
@@ -14,6 +15,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.quark.transform import (
     OrthogonalTransform,
+    build_hadamard_matrix,
     rotation_weight_loader,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -37,7 +39,75 @@ from vllm.platforms import current_platform
 
 from .quark_scheme import QuarkScheme
 
+# Fused rotation+quant layout (align with OCP_MX_BLOCK_SIZE=32)
+FP4_ELEMS_PER_BYTE = 2
+SCALE_COL_ALIGN = 8
+SCALE_ROW_TILE = 256
+DECODE_MAX_M = OCP_MX_BLOCK_SIZE  # decode path: M < DECODE_MAX_M uses raw scales
+
+# Fused rotation + MXFP4 quantization kernel (Gluon v2) — registered as custom op
+_has_fused_triton_rot_quant = False
+try:
+    from vllm.model_executor.layers.quantization.quark.fused_rotation_quant_gluon import (
+        fused_rot_quant_gluon as _fused_rot_quant_gluon,
+    )
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _fused_rot_quant_op(
+        x: torch.Tensor,
+        rotation: torch.Tensor,
+        rotation_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_2d = x.reshape(-1, x.shape[-1])
+        M, K = x_2d.shape
+        sn_padded = (K // 32 + 7) // 8 * 8
+        sm_padded = (M + 255) // 256 * 256
+        fp4 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+        sc = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
+        if M < 32:
+            sc_raw = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
+            fp4, sc_raw = _fused_rot_quant_gluon(x_2d, rotation, rotation_size,
+                                                fp4_out=fp4, scales_out=sc_raw, shuffle_scales=False)
+            sc[:M, :K//32] = sc_raw
+        else:
+            sc.zero_()
+            fp4, sc = _fused_rot_quant_gluon(x_2d, rotation, rotation_size,
+                                            fp4_out=fp4, scales_out=sc, shuffle_scales=True)
+        return fp4, sc
+
+    def _fused_rot_quant_fake(
+        x: torch.Tensor,
+        rotation: torch.Tensor,
+        rotation_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M = x.reshape(-1, x.shape[-1]).shape[0]
+        K = x.shape[-1]
+        # Always return padded shape for CUDAGraph compatibility
+        sn_padded = (K // 32 + 7) // 8 * 8
+        sm_padded = (M + 255) // 256 * 256
+        return (
+            torch.empty((M, K // 2), dtype=torch.uint8, device=x.device),
+            torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device),
+        )
+
+    direct_register_custom_op(
+        op_name="fused_rotation_mxfp4_quant",
+        op_func=_fused_rot_quant_op,
+        mutates_args=[],
+        fake_impl=_fused_rot_quant_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+    def _fused_rot_quant(x, rotation, rotation_size=128, **kwargs):
+        return torch.ops.vllm.fused_rotation_mxfp4_quant(x, rotation, rotation_size)
+
+    _has_fused_triton_rot_quant = True
+    print("[INFO] Registered fused_rotation_mxfp4_quant as custom op (CUDAGraph compatible)")
+except ImportError:
+    pass
+
 logger = init_logger(__name__)
+
 
 
 # TODO: move registration of custom op to aiter_ops.py
@@ -54,6 +124,19 @@ def is_rocm_aiter_fp4_asm_gemm_enabled() -> bool:
         and envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
         and envs.VLLM_ROCM_USE_AITER
     )
+
+
+def is_fused_rotation_quant_enabled() -> bool:
+    """Switch for Dense rotation+quant: fused (one kernel) vs separated (matmul then quant).
+    Default 0 to avoid fused when there is no rotation (e.g. RTN); set 1 for fused on
+    rotation models (Hadamard or trained both have rotation matrices).
+    - VLLM_DISABLE_FUSED_ROT_QUANT=1 or true → separated (backward compat)
+    - VLLM_USE_FUSED_ROTATION_QUANT=1 or true → fused; =0 or false → separated
+    - Default: 0 (separated). Use 1 for Hadamard/trained when fused is desired."""
+    if os.environ.get("VLLM_DISABLE_FUSED_ROT_QUANT", "").strip().lower() in ("1", "true"):
+        return False
+    v = os.environ.get("VLLM_USE_FUSED_ROTATION_QUANT", "0").strip().lower()
+    return v in ("1", "true")
 
 
 try:
@@ -76,18 +159,46 @@ try:
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
         x_scales: torch.Tensor | None = None,
+        rotation: torch.Tensor | None = None,
+        rotation_size: int = 0,
     ) -> torch.Tensor:
         M = x.shape[0]
         N = weight.shape[0]
         K = weight.shape[1]
+        # Fused rotation+quant if rotation provided
+        if rotation is not None and rotation_size > 0 and _has_fused_triton_rot_quant:
+            x_2d = x.reshape(-1, x.shape[-1])
+            K_in = x.shape[-1]
+            n_scale_groups = K_in // OCP_MX_BLOCK_SIZE
+            fp4_cols = K_in // FP4_ELEMS_PER_BYTE
+            is_tuned_decode = (
+                rocm_use_aiter_fp4_asm_gemm
+                and M < DECODE_MAX_M
+                and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K)
+            )
+            shuffle_scales = not is_tuned_decode
+            if is_tuned_decode:
+                fp4_buf = torch.empty((M, fp4_cols), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.empty((M, n_scale_groups), dtype=torch.uint8, device=x.device)
+            else:
+                sn_pad = (n_scale_groups + SCALE_COL_ALIGN - 1) // SCALE_COL_ALIGN * SCALE_COL_ALIGN
+                sm_pad = (M + SCALE_ROW_TILE - 1) // SCALE_ROW_TILE * SCALE_ROW_TILE
+                fp4_buf = torch.empty((M, fp4_cols), dtype=torch.uint8, device=x.device)
+                sc_buf = torch.empty((sm_pad, sn_pad), dtype=torch.uint8, device=x.device)
+            x_q, x_s = _fused_rot_quant_gluon(
+                x_2d, rotation, rotation_size,
+                fp4_out=fp4_buf, scales_out=sc_buf, shuffle_scales=shuffle_scales,
+            )
+            x_q = x_q.view(torch.float4_e2m1fn_x2)
+            x_s = x_s.view(torch.float8_e8m0fnu)
+            x_scales = x_s
+            x = x_q
         if rocm_use_aiter_fp4_asm_gemm:
             if M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
                 if x_scales is None:
-                    # use hip quant kernel for performance
-                    if M >= 32:
-                        x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
-                    else:
-                        x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=False)
+                    # Tuned decode M < 32 needs raw scales; else shuffled
+                    shuffle_hip = M >= DECODE_MAX_M
+                    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=shuffle_hip)
                 else:
                     x_q = x
                     x_s = x_scales
@@ -110,8 +221,8 @@ try:
                 )
             else:
                 if x_scales is None:
-                    # use hip quant kernel for performance
-                    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+                    shuffle_hip = True  # untuned path always needs shuffled scales
+                    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=shuffle_hip)
                 else:
                     x_q = x
                     x_s = x_scales
@@ -125,8 +236,10 @@ try:
                     dtype=out_dtype,
                 )
 
+                w = weight.view(torch.float4_e2m1fn_x2) if weight.dtype == torch.uint8 else weight
+                ws = weight_scale.view(torch.float8_e8m0fnu) if weight_scale.dtype == torch.uint8 else weight_scale
                 gemm_a4w4(
-                    x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
+                    x_q, w, x_s, ws.view(x_s.dtype), y, bpreshuffle=True
                 )
             return y[:M]
         else:
@@ -146,9 +259,11 @@ try:
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        x_scales: torch.Tensor = None,
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
+        x_scales: torch.Tensor | None = None,
+        rotation: torch.Tensor | None = None,
+        rotation_size: int = 0,
     ) -> torch.Tensor:
         return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -190,7 +305,12 @@ class QuarkOCP_MX(QuarkScheme):
         ) = OrthogonalTransform.setup_transform(
             quant_config=quant_config, layer_names=layer_names
         )
-
+        # Hadamard: trainable=False, matrix generated in vLLM; trained: trainable=True, matrix loaded from checkpoint
+        self.is_hadamard_rotation = bool(
+            self.use_online_rotation
+            and self.rotation_config is not None
+            and not self.rotation_config.get("trainable", True)
+        )
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
 
@@ -228,6 +348,20 @@ class QuarkOCP_MX(QuarkScheme):
         )
 
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
+
+        # Fused rotation+quant vs separated: controlled by env switch
+        self.use_fused_rotation_quant = (
+            self.use_online_rotation
+            and _has_fused_triton_rot_quant
+            and not self.emulate
+            and is_fused_rotation_quant_enabled()
+        )
+        if self.use_fused_rotation_quant:
+            logger.info("Using fused Triton rotation+MXFP4 quant kernel")
+        elif self.use_online_rotation and _has_fused_triton_rot_quant and not self.emulate:
+            logger.info(
+                "Using separated rotation+quant (set VLLM_USE_FUSED_ROTATION_QUANT=1 for fused)"
+            )
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
             # Currently need these kernels if not emulating
@@ -353,9 +487,13 @@ class QuarkOCP_MX(QuarkScheme):
 
         if self.use_online_rotation:
             dtype = torch.float64 if self.rotation_config["trainable"] else torch.int8  # type: ignore[index]
-
+            # Hadamard (trainable=False): Quark does not export the matrix; generate in vLLM for both fused and separated
+            if self.is_hadamard_rotation:
+                rot_data = build_hadamard_matrix(self.rotation_size, dtype=dtype)
+            else:
+                rot_data = torch.empty(self.rotation_size, self.rotation_size, dtype=dtype)
             input_rotation = ModelWeightParameter(
-                data=torch.empty(self.rotation_size, self.rotation_size, dtype=dtype),
+                data=rot_data,
                 input_dim=1,
                 output_dim=0,
                 weight_loader=rotation_weight_loader,
@@ -372,7 +510,20 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_online_rotation:
+        if self.use_fused_rotation_quant:
+            # Fused rotation+quant inside gemm_with_dynamic_quant (CUDAGraph safe)
+            rotation = self.input_transform.input_rotation.data
+            return torch.ops.vllm.gemm_with_dynamic_quant(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                self.rocm_use_aiter_fp4_asm_gemm,
+                self.out_dtype,
+                rotation=rotation,
+                rotation_size=self.rotation_size,
+            )
+        elif self.use_online_rotation:
+            # Separated path: rotation matmul + separate quant
             x = self.input_transform(x)
 
         if self.emulate:

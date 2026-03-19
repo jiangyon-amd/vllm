@@ -482,6 +482,10 @@ class Qwen2Model(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                # Rotation weights use merged names (e.g. gate_up_proj.input_rotation).
+                # Do not apply replace(up_proj->gate_up_proj) or we get gate_gate_up_proj.
+                if "input_rotation" in name and param_name in name:
+                    continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
