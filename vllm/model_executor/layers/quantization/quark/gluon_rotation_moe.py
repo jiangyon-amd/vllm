@@ -5,7 +5,7 @@ Single kernel parameterized by k_width (constexpr):
   k_width=4  → used for M<4  (V2 behaviour, less MFMA pressure at tiny M)
   k_width=8  → used for M>=4 (V3 behaviour, better throughput via wider dot)
 
-Dispatch (called from aiter_rotation_patch.py):
+Dispatch (called from fused_moe_rotation.py):
   gluon_moe_rotation(x, rotation, rotation_size, M)
 """
 
