@@ -14,7 +14,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Whether MoE fused rotation+quant pipeline is active (aiter 3-in-1 path).
+# Whether MoE fused rotation pipeline is active.
 FUSED_MOE_ROTATION: bool = os.getenv("VLLM_MOE_FUSED_ROTATION", "1") == "1"
 
 # ---------------------------------------------------------------------------
@@ -69,10 +69,10 @@ if _is_moe_gluon_rotation_enabled():
     except Exception as e:
         logger.warning("Failed to apply MoE Gluon rotation patch: %s", e)
 
+# _has_moe_rot_quant: True when aiter supports MoE fused rotation
+# (rocm_aiter_ops.fused_moe accepts rotation/rotation_size kwargs).
 try:
-    from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_sort import (  # noqa: F401
-        fused_rotation_mxfp4_quant_moe_sort,
-    )
-    _has_moe_rot_quant = True
+    from vllm._aiter_ops import rocm_aiter_ops as _aiter_ops
+    _has_moe_rot_quant = hasattr(_aiter_ops, 'fused_moe')
 except Exception:
     _has_moe_rot_quant = False
