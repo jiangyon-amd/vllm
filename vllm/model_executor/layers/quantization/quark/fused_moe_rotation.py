@@ -76,5 +76,3 @@ try:
 except Exception:
     _has_moe_rot_quant = False
 
-# Keep FUSED_MOE_ROTATION as alias for backward compat with qwen3_moe.py import
-FUSED_MOE_ROTATION = _has_moe_rot_quant

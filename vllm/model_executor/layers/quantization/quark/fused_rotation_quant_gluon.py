@@ -25,7 +25,7 @@ NUM_WARPS = 4
 
 
 @gluon.jit
-def _fused_rot_quant_gluon(
+def _fused_rot_quant_gluon_kernel(
     x_ptr, rot_ptr, fp4_ptr, scale_ptr,
     M, K, sn_padded,
     stride_x_m, stride_rot_r, stride_rot_c,
@@ -214,7 +214,7 @@ def fused_rot_quant_gluon(
             scales_out = torch.empty((M, n_scales), dtype=torch.uint8, device=x.device)
 
     grid = (triton.cdiv(M, BLOCK_M), K // RS)
-    _fused_rot_quant_gluon[grid](
+    _fused_rot_quant_gluon_kernel[grid](
         x, rotation, fp4_out, scales_out, M, K, sn_padded,
         x.stride(0), rotation.stride(0), rotation.stride(1),
         fp4_out.stride(0), scales_out.stride(0),
