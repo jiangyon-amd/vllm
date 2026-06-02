@@ -378,7 +378,7 @@ class QuarkOCP_MX(QuarkScheme):
             logger.info("Using fused Triton rotation+MXFP4 quant kernel")
         elif self.use_online_rotation and _has_fused_triton_rot_quant and not self.emulate:
             logger.info(
-                "Using separated rotation+quant (set VLLM_USE_FUSED_ROTATION_QUANT=1 for fused)"
+                "Using separated rotation+quant (set VLLM_FUSED_ROTATION=1 for fused)"
             )
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):

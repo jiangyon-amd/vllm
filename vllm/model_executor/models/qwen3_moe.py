@@ -231,9 +231,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.w13_input_rotation, rot_cfg
         )
         from vllm.model_executor.layers.quantization.quark.fused_moe_rotation import (
-            FUSED_MOE_ROTATION, _has_moe_rot_quant,
+            _has_moe_rot_quant,
         )
-        self._use_fused_moe_rotation = FUSED_MOE_ROTATION and _has_moe_rot_quant
+        self._use_fused_moe_rotation = _has_moe_rot_quant
         mode = "fused" if self._use_fused_moe_rotation else "separated"
         logger.info("MoE rotation enabled for %s (rotation_size=%d, mode=%s)", prefix, rotation_size, mode)
 
