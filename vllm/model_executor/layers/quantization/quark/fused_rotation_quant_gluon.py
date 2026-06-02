@@ -3,7 +3,7 @@ Fused Rotation + MXFP4 Quant — Gluon Triton kernel.
 
 Single kernel: rotation matmul (MFMA) + MXFP4 quantization + scale shuffle.
 For dense attention/MLP layers (Qwen3-8B/14B/32B).
-MoE rotation paths live in separate files (gluon_rotation_only_v2/v3).
+MoE rotation path lives in gluon_rotation_moe.py.
 """
 
 import torch
