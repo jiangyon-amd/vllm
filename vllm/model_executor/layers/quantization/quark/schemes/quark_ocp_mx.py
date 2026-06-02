@@ -207,10 +207,12 @@ try:
                     fp4_out=fp4_buf, scales_out=sc_buf,
                     shuffle_scales=shuffle_scales,
                 )
-            x_q = x_q.view(torch.float4_e2m1fn_x2)
-            x_s = x_s.view(torch.float8_e8m0fnu)
-            x_scales = x_s
-            x = x_q
+            # Keep as uint8 here; view to float4/float8 happens inside each
+            # GEMM branch below, after rocm_use_aiter_fp4_asm_gemm dispatch.
+            # This avoids passing float4_e2m1fn_x2 to Triton kernels that do
+            # not recognise it in canonicalize_dtype (aiter gemm_afp4wfp4 bug).
+            x_scales = x_s.view(torch.float8_e8m0fnu)
+            x = x_q  # uint8, re-viewed per-branch below
         if rocm_use_aiter_fp4_asm_gemm:
             if M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
                 if x_scales is None:
@@ -256,16 +258,19 @@ try:
 
                 w = weight.view(torch.float4_e2m1fn_x2) if weight.dtype == torch.uint8 else weight
                 ws = weight_scale.view(torch.float8_e8m0fnu) if weight_scale.dtype == torch.uint8 else weight_scale
+                x_q_f4 = x_q.view(torch.float4_e2m1fn_x2) if x_q.dtype == torch.uint8 else x_q
                 gemm_a4w4(
-                    x_q, w, x_s, ws.view(x_s.dtype), y, bpreshuffle=True
+                    x_q_f4, w, x_s, ws.view(x_s.dtype), y, bpreshuffle=True
                 )
             return y[:M]
         else:
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:
-                x_q = x
-                x_s = x_scales
+                # x may be uint8 from fused rotation path; gemm_afp4wfp4
+                # expects float4_e2m1fn_x2 / float8_e8m0fnu.
+                x_q = x.view(torch.float4_e2m1fn_x2) if x.dtype == torch.uint8 else x
+                x_s = x_scales.view(torch.float8_e8m0fnu) if x_scales.dtype == torch.uint8 else x_scales
             y = torch.empty(
                 x_q.shape[0], weight.shape[0], device=x_q.device, dtype=out_dtype
             )
