@@ -1,19 +1,9 @@
 """
-Fused Rotation + MXFP4 Quant + MoE Sort — unified thin wrapper.
+Fused Rotation + MXFP4 Quant + MoE Sort — dispatcher.
 
-Real E2E shape benchmark on MI355X (CUDAGraph, Qwen3-30B-A3B, topk=4):
-  M=1 decode:   Triton-legacy 3.3µs > HIP 5.2µs > Gluon-M1 4.8µs
-                → Triton _rot_quant_sort_m1_kernel (num_warps=1) is fastest
-  M=2~64 decode/prefill: HIP MFMA 3-in-1 5.7~7.1µs > Gluon-kw8 6.9~7.5µs
-                → aiter-auto (AITER_MOE_HIP_MFMA=1) is optimal
-  M≥128 prefill: Gluon-kw8 7.3~9.6µs ≈ HIP 7.6~9.3µs (within noise)
-                → aiter-auto handles correctly
-
-Dispatch policy (this file implements):
-  M == 1:  Triton _rot_quant_sort_m1_kernel directly (bypasses aiter-auto)
-  M > 1:   aiter fused_rot_quant_moe_sort (AITER_MOE_HIP_MFMA=1 → HIP path)
-
-HIP MFMA is enabled by default via fused_moe_rotation.py (AITER_MOE_HIP_MFMA=1).
+Dispatch policy (MI355X CUDAGraph benchmark, Qwen3-30B-A3B, topk=4):
+  M == 1:  Triton-legacy kernel (3.3µs) — faster than aiter Gluon-M1 (4.8µs)
+  M > 1:   aiter unified API (HIP MFMA 3-in-1 via AITER_MOE_HIP_MFMA=1)
 """
 
 import logging
@@ -78,38 +68,6 @@ def _get_triton_m1_bufs(K: int, m_pad: int, n_i: int, device: torch.device):
     sc_buf  = torch.empty((m_pad, n_i), dtype=torch.uint8, device=device)
     _triton_m1_buf_cache[key] = (fp4_buf, sc_buf)
     return fp4_buf, sc_buf
-
-
-# Buffer cache for Gluon v4 path (CUDAGraph compatibility).
-_gluon_v4_buf_cache: dict = {}
-
-def _get_gluon_v4_bufs(K: int, m_pad: int, M: int, device: torch.device):
-    """Pre-allocate Gluon v4 output buffers (m_pad scatter rows + M scratch rows)."""
-    BLOCK_M = 32
-    n_i = K // 32
-    m_o = m_pad   # Conservative: m_o ≤ m_pad always
-    scratch_rows = ((M + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
-    total_rows = max(m_pad, m_o) + scratch_rows
-    key = (K, m_pad, M, device.index if device.index is not None else 0)
-    cached = _gluon_v4_buf_cache.get(key)
-    if cached is not None:
-        return cached
-    fp4_buf = torch.empty((M, K // 2), dtype=torch.uint8, device=device)
-    sc_buf  = torch.zeros((total_rows, n_i), dtype=torch.uint8, device=device)
-    _gluon_v4_buf_cache[key] = (fp4_buf, sc_buf)
-    return fp4_buf, sc_buf
-
-# ---------------------------------------------------------------------------
-# Re-export helper used by fused_rotation_mxfp4_quant_moe_gluon.py
-# ---------------------------------------------------------------------------
-def _pick_decode_max_q(m_pad: int) -> int:
-    """Pick MAX_Q bucket for decode kernel grid launch."""
-    if m_pad <= 64:
-        return 64
-    elif m_pad <= 128:
-        return 128
-    else:
-        return 256
 
 
 # ---------------------------------------------------------------------------
@@ -224,58 +182,10 @@ def _fused_rot_quant_moe_sort_impl(
     token_num: int,
     topk: int,
     block_size: int = 32,
-    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Core implementation.
-
-    Dispatch:
-      M == 1: Triton-legacy _rot_quant_sort_m1_kernel (3.3µs, fastest for decode)
-      M > 1:  aiter unified (HIP MFMA 3-in-1 via AITER_MOE_HIP_MFMA=1)
-    """
+    """Dispatch: M==1 → Triton-legacy (3.3µs); M>1 → aiter unified (HIP MFMA)."""
     RS = rotation_size
     M, K = x.shape
-
-    # NEW: Gluon v2 (mirrors dense Gluon, single 3-in-1 kernel for all M)
-    # Enable via VLLM_MOE_USE_GLUON_V2=1
-    if os.getenv("VLLM_MOE_USE_GLUON_V2", "0") == "1":
-        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_gluon_v2 import (
-            fused_rot_quant_moe_sort_gluon_v2,
-        )
-        return fused_rot_quant_moe_sort_gluon_v2(
-            x, rotation, RS,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=block_size,
-        )
-
-    # NEW: Gluon v4 (2-kernel: Gluon MFMA+FP4 + Triton flat scatter, GEAK-optimized)
-    # Enable via VLLM_MOE_USE_GLUON_V4=1
-    # Unit: K1+K2 GPU time = 27-29µs (vs HIP 8-16µs, vs Sep 38µs)
-    # 100% FP4 precision match vs bf16 reference (HIP MFMA gives only ~82%)
-    if os.getenv("VLLM_MOE_USE_GLUON_V4", "0") == "1":
-        from vllm.model_executor.layers.quantization.quark.fused_rotation_mxfp4_quant_moe_gluon_v4 import (
-            fused_rot_quant_moe_sort_gluon_v4,
-        )
-        m_pad = ((sorted_ids.shape[0] + block_size - 1) // block_size) * block_size
-        # Pre-allocate buffers for CUDAGraph compatibility
-        fp4_out, sc_out = _get_gluon_v4_bufs(K, m_pad, M, x.device)
-        # Derive num_experts from sorted_ids size (m_o = E * block_size for default moe_sorting)
-        num_experts = sorted_ids.shape[0] // block_size
-        fp4_v4, sc_v4 = fused_rot_quant_moe_sort_gluon_v4(
-            x, rotation, RS,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            m_pad=m_pad,
-            fp4_out=fp4_out,
-            sorted_scale_out=sc_out,
-            topk=topk,
-            num_experts=num_experts,
-            block_size=block_size,
-        )
-        return fp4_v4.view(dtypes.fp4x2), sc_v4.view(dtypes.fp8_e8m0)
 
     # M=1 decode: use faster Triton-legacy kernel (bypasses aiter Gluon-M1)
     # 3.3µs vs Gluon-M1 4.8µs — 31% faster for single-token decode.
@@ -321,14 +231,8 @@ def fused_rotation_mxfp4_quant_moe_sort(
     token_num: int,
     topk: int,
     block_size: int = 32,
-    use_hip_kernel: bool | None = None,
-    use_triton_rot_sort_kernel: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused rotation + MXFP4 quant + MoE sort.
-    Uses custom op when available (CUDAGraph compatible).
-    Legacy kwargs (use_hip_kernel, use_triton_rot_sort_kernel) are ignored.
-    """
+    """Fused rotation + MXFP4 quant + MoE sort. CUDAGraph compatible."""
     if _has_custom_op:
         return torch.ops.vllm.fused_rotation_mxfp4_quant_moe_sort(
             x, rotation, rotation_size,
