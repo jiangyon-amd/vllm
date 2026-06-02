@@ -1,37 +1,34 @@
-#!/usr/bin/env python3
 """
-Gluon Rotation V3 — apply Dense Gluon's optimization tricks to MoE rotation.
+Gluon rotation kernels for MoE hidden states.
 
-Differences from V2:
-- k_width=8 (was 4) — bigger dot operand layout, fewer MFMA instructions per tile
-- num_stages=3 — pipelining hint for better instruction overlap
-- Same MFMA structure (proven to win E2E in dense)
+Single kernel parameterized by k_width (constexpr):
+  k_width=4  → used for M<4  (V2 behaviour, less MFMA pressure at tiny M)
+  k_width=8  → used for M>=4 (V3 behaviour, better throughput via wider dot)
 
-Insight: Dense Gluon already exploits "K is small (RS=128), no inter-block accumulation"
-- Each CTA processes one K-block (BLOCK_M × RS)
-- k_width=8 packs 2x K data per layout iteration for better throughput
-- num_stages=3 pipelines memory loads with compute
+Dispatch (called from aiter_rotation_patch.py):
+  gluon_moe_rotation(x, rotation, rotation_size, M)
 """
+
 import torch
 import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 BLOCK_M = 32
 NUM_WARPS = 4
-NUM_STAGES = 3   # ★ NEW: pipelining
+NUM_STAGES = 3
 
 
 @gluon.jit
-def _gluon_rotation_v3_kernel(
+def _gluon_rotation_kernel(
     x_ptr, rot_ptr, y_ptr,
     M, sx_m, sr_r, sr_c, sy_m,
     RS:        gl.constexpr,
     BLOCK_M:   gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    K_WIDTH:   gl.constexpr,  # 4 for M<4, 8 for M>=4
 ):
-    """Rotation kernel with Dense Gluon's k_width=8 + num_stages=3 optimization."""
+    """Parallel rotation: one CTA per (M-tile, K-block). Grid: (ceil(M/BM), K//RS)."""
     pid_m = gl.program_id(0)
     pid_rot = gl.program_id(1)
 
@@ -39,16 +36,15 @@ def _gluon_rotation_v3_kernel(
         version=4, instr_shape=[16, 16], transposed=True,
         warps_per_cta=[2, 2], tiles_per_warp=[1, 4])
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8], threads_per_warp=[16, 4],   # ★ size_per_thread [1,8] for k_width=8
+        size_per_thread=[1, K_WIDTH], threads_per_warp=[16, 4],
         warps_per_cta=[NUM_WARPS, 1], order=[1, 0])
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8, 1], threads_per_warp=[4, 16],   # ★ size_per_thread [8,1] for k_width=8
+        size_per_thread=[K_WIDTH, 1], threads_per_warp=[4, 16],
         warps_per_cta=[1, NUM_WARPS], order=[0, 1])
     shared_rot: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0])
-    # ★ k_width=8 (was 4)
-    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
-    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=K_WIDTH)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=K_WIDTH)
     store_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 4], threads_per_warp=[2, 32],
         warps_per_cta=[NUM_WARPS, 1], order=[1, 0])
@@ -83,6 +79,7 @@ def _gluon_rotation_v3_kernel(
 
 _y_cache: dict = {}
 
+
 def _get_y_buf(shape, dtype, device):
     key = (shape, dtype, device.index if device.index is not None else 0)
     if key not in _y_cache:
@@ -90,26 +87,36 @@ def _get_y_buf(shape, dtype, device):
     return _y_cache[key]
 
 
-def gluon_rotation_v3(
+def gluon_moe_rotation(
     x: torch.Tensor,
     rotation: torch.Tensor,
-    rotation_size: int = None,
-    out: torch.Tensor = None,
+    rotation_size: int,
 ) -> torch.Tensor:
-    """V3 rotation kernel: k_width=8 + num_stages=3 (Dense Gluon's optimization)."""
+    """Apply blockwise rotation to MoE hidden states using Gluon MFMA kernel.
+
+    Args:
+        x: Input [M, K] bfloat16.
+        rotation: Rotation matrix [RS, RS] bfloat16.
+        rotation_size: Block size RS. K must be divisible by RS.
+
+    Returns:
+        Rotated tensor [M, K] bfloat16 (pre-allocated buffer, CUDAGraph-safe).
+    """
     assert x.ndim == 2 and rotation.ndim == 2
     M, K = x.shape
-    RS = rotation_size if rotation_size is not None else rotation.shape[0]
+    RS = rotation_size
     assert K % RS == 0
-    if out is None:
-        out = _get_y_buf((M, K), torch.bfloat16, x.device)
 
+    out = _get_y_buf((M, K), torch.bfloat16, x.device)
     grid = (triton.cdiv(M, BLOCK_M), K // RS)
-    _gluon_rotation_v3_kernel[grid](
+
+    # k_width=8 wins for M>=4 (better MFMA throughput); k_width=4 for M<4
+    k_width = 8 if M >= 4 else 4
+    _gluon_rotation_kernel[grid](
         x, rotation, out,
         M, x.stride(0), rotation.stride(0), rotation.stride(1), out.stride(0),
-        RS=RS, BLOCK_M=BLOCK_M, NUM_WARPS=NUM_WARPS,
+        RS=RS, BLOCK_M=BLOCK_M, NUM_WARPS=NUM_WARPS, K_WIDTH=k_width,
         num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,   # ★ pipelining
+        num_stages=NUM_STAGES,
     )
     return out
