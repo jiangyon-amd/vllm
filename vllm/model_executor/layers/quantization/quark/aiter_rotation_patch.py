@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-GEAK iter 9: Simpler patch — replace torch.matmul rotation with Gluon rotation kernel.
+MoE Gluon rotation patch — replaces torch.matmul rotation with Gluon kernel.
 
 Insight: Gluon rotation-only kernel (no quant, no scatter) beats torch.matmul
-for M=4-16 (where most prefill batches land). Saves 0-3µs per MoE call.
+for M=4-16 (where most decode batches land). Saves 0-3µs per MoE call.
 
 Strategy:
 - Replace ONLY the torch.matmul rotation step in aiter's fused_moe_2stages
 - Keep aiter's first branch (bf16 → asm_stage1 with inline quant) - optimal
 - Best of both worlds: faster rotation + optimal inline quant
 
-Enable via VLLM_MOE_FORCE_GLUON_ROTATION=1
+Activation (in priority order):
+  VLLM_FUSED_ROTATION=1           → unified switch (also enables Dense Gluon)
+  VLLM_MOE_FORCE_GLUON_ROTATION=1 → legacy MoE-only switch
+
+Both are handled in fused_moe_rotation.py which calls apply_gluon_rotation_patch().
 """
 import os
 import logging

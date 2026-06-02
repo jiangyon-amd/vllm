@@ -140,25 +140,23 @@ def _fused_rot_quant_gluon(
         size_per_thread=[1, 1], threads_per_warp=[32, 2],
         warps_per_cta=[NUM_WARPS, 1], order=[1, 0],
     )
-    sc_s = gl.convert_layout(e8m0_u8, sc_store2)
+    shared_sc: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0],
+    )
     sc_m_idx = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
     sc_q_idx = gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
     sc_mask = (m_base + sc_m_idx[:, None]) < M
     sc_base = pid_rot * NUM_QG
 
     if SHUFFLE_SCALES:
-        # Two-phase shuffle via global temp rows.
-        # gl.convert_layout loses data for NUM_QG>2, but raw store with
-        # SliceLayout broadcasting writes all values correctly.
-        raw_off = ((M + 31) // 32) * 32
-        # Phase 1: raw store to temp rows
-        tl.store(scale_ptr + (m_base + sc_m_idx[:, None] + raw_off) * stride_sc_m
-                 + (sc_base + sc_q_idx[None, :]),
-                 sc_s, mask=sc_mask)
-        # Phase 2: load from temp, scatter to shuffled positions
-        raw_val = tl.load(scale_ptr + (m_base + sc_m_idx[:, None] + raw_off) * stride_sc_m
-                          + (sc_base + sc_q_idx[None, :]),
-                          mask=sc_mask, other=0)
+        # LDS round-trip for scale layout conversion (a4w4 GEMM scale-pipeline
+        # pattern: LW -> LR). The register-side gl.convert_layout drops the rep
+        # elements for NUM_QG>2, but reading back from LDS recovers the full
+        # layout, so we avoid the previous two-phase GLOBAL temp round-trip and
+        # keep only the single scatter store to the AMD-shuffled positions.
+        smem_sc = gl.allocate_shared_memory(gl.uint8, [BLOCK_M, NUM_QG], layout=shared_sc)
+        smem_sc.store(e8m0_u8)
+        sc_redist = smem_sc.load(sc_store2)
         col = sc_base + sc_q_idx
         flat = ((col >> 3)[None, :] * 256
                 + (col & 3)[None, :] * 64
@@ -166,8 +164,9 @@ def _fused_rot_quant_gluon(
                 + ((col >> 2) & 1)[None, :] * 2
                 + (sc_m_idx >> 4)[:, None])
         tl.store(scale_ptr + (flat // sn_padded + m_base) * stride_sc_m + flat % sn_padded,
-                 raw_val, mask=sc_mask)
+                 sc_redist, mask=sc_mask)
     else:
+        sc_s = gl.convert_layout(e8m0_u8, sc_store2)
         sc_m = m_base + sc_m_idx
         sc_c = sc_base + sc_q_idx
         tl.store(scale_ptr + sc_m[:, None] * stride_sc_m + sc_c[None, :],
@@ -191,14 +190,15 @@ def fused_rot_quant_gluon(
         fp4_out = torch.empty((M, K // FP4_ELEMS_PER_BYTE), dtype=torch.uint8, device=x.device)
 
     if shuffle_scales:
+        # LDS round-trip needs no global temp rows: sm_padded (256-aligned) is
+        # exactly enough and matches the dispatch's pre-allocated buffer, so no
+        # per-call reallocation (CUDAGraph-safe).
         sn_padded = (n_scales + SCALE_COL_ALIGN - 1) // SCALE_COL_ALIGN * SCALE_COL_ALIGN
         sm_padded = (M + SCALE_ROW_TILE - 1) // SCALE_ROW_TILE * SCALE_ROW_TILE
-        raw_row_offset = (M + ROW_ALIGN - 1) // ROW_ALIGN * ROW_ALIGN
-        sm_with_temp = max(sm_padded, raw_row_offset + (M + ROW_ALIGN - 1) // ROW_ALIGN * ROW_ALIGN)
         if scales_out is None:
-            scales_out = torch.empty((sm_with_temp, sn_padded), dtype=torch.uint8, device=x.device)
-        elif scales_out.shape[0] < sm_with_temp:
-            scales_out = torch.empty((sm_with_temp, sn_padded), dtype=torch.uint8, device=x.device)
+            scales_out = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
+        elif scales_out.shape[0] < sm_padded:
+            scales_out = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
     else:
         sn_padded = n_scales
         if scales_out is None:

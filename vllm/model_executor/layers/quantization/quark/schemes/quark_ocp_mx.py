@@ -198,14 +198,27 @@ def is_rocm_aiter_fp4_asm_gemm_enabled() -> bool:
 
 
 def is_fused_rotation_quant_enabled() -> bool:
-    """Switch for Dense rotation+quant: fused (one kernel) vs separated (matmul then quant).
-    Default 0 to avoid fused when there is no rotation (e.g. RTN); set 1 for fused on
-    rotation models (Hadamard or trained both have rotation matrices).
-    - VLLM_DISABLE_FUSED_ROT_QUANT=1 or true → separated (backward compat)
-    - VLLM_USE_FUSED_ROTATION_QUANT=1 or true → fused; =0 or false → separated
-    - Default: 0 (separated). Use 1 for Hadamard/trained when fused is desired."""
+    """Switch for Dense Gluon rotation+quant: fused (one kernel) vs separated (matmul then quant).
+
+    Unified switch (recommended):
+      VLLM_FUSED_ROTATION=1   → enable both Dense Gluon + MoE Gluon kernels
+      VLLM_FUSED_ROTATION=0   → disable both (separated path)
+
+    Legacy switches (still supported for backward compatibility):
+      VLLM_USE_FUSED_ROTATION_QUANT=1  → enable Dense Gluon only
+      VLLM_DISABLE_FUSED_ROT_QUANT=1   → force separated regardless
+
+    Default: 0 (separated). Set VLLM_FUSED_ROTATION=1 for rotation models
+    (Hadamard or trained) to activate both Dense and MoE Gluon kernels."""
     if os.environ.get("VLLM_DISABLE_FUSED_ROT_QUANT", "").strip().lower() in ("1", "true"):
         return False
+    # Unified switch takes priority
+    unified = os.environ.get("VLLM_FUSED_ROTATION", "").strip().lower()
+    if unified in ("1", "true"):
+        return True
+    if unified in ("0", "false"):
+        return False
+    # Legacy switch fallback
     v = os.environ.get("VLLM_USE_FUSED_ROTATION_QUANT", "0").strip().lower()
     return v in ("1", "true")
 
