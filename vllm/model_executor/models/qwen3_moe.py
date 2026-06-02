@@ -191,6 +191,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
         self.moe_input_transform = None
+        self._use_fused_moe_rotation = False
         self._init_moe_rotation(quant_config, config, prefix)
 
     def _init_moe_rotation(self, quant_config, config, prefix):
@@ -268,11 +269,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         router_logits, _ = self.gate(hidden_states)
 
-        if self.moe_input_transform is not None:
-            if self._use_fused_moe_rotation:
-                pass  # rotation handled by Triton 3-in-1 kernel inside quark_moe
-            else:
-                hidden_states = self.moe_input_transform(hidden_states)
+        if self.moe_input_transform is not None and not self._use_fused_moe_rotation:
+            # Separated path: apply rotation here. Fused path: rotation is
+            # passed via experts._moe_rotation and applied inside fused_moe_2stages.
+            hidden_states = self.moe_input_transform(hidden_states)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits

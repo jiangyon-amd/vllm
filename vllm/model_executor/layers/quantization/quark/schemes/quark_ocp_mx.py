@@ -46,18 +46,16 @@ SCALE_ROW_TILE = 256
 DECODE_MAX_M = OCP_MX_BLOCK_SIZE  # decode path: M < DECODE_MAX_M uses raw scales
 
 # ---------------------------------------------------------------------------
-# Fused rotation + MXFP4 quantization — registered as custom op.
+# Fused rotation + MXFP4 quantization kernel selection.
 #
-# HIP MFMA dense kernel is 2-3x faster than Gluon Triton at kernel level.
-# Requires aiter >= 0.1 with correct mutates_args registration so that
-# torch.compile/CUDAGraph sees x and rotation as read-only.
-# Use VLLM_DENSE_HIP_MFMA=0 to force Gluon Triton fallback.
+# Two backends (selected inside gemm_with_dynamic_quant):
+#   HIP MFMA  (aiter.ops.mfma_rot_quant_dense) — enabled via VLLM_DENSE_HIP_MFMA=1 (default)
+#   Gluon Triton (fused_rotation_quant_gluon)   — fallback when HIP MFMA unavailable,
+#                                                  or always when VLLM_DENSE_HIP_MFMA=0
 # ---------------------------------------------------------------------------
-_has_fused_triton_rot_quant = False
 _use_hip_mfma_dense = False
 
-# HIP MFMA dense kernel — enabled by default (2-3x faster, CUDAGraph safe
-# after aiter mutates_args fix)
+# HIP MFMA dense kernel — enabled by default; Gluon is preferred when available
 if os.environ.get("VLLM_DENSE_HIP_MFMA", "1") == "1":
     try:
         from aiter.ops.mfma_rot_quant_dense import (
@@ -75,119 +73,11 @@ try:
 except ImportError:
     _fused_rot_quant_gluon = None
 
-if _use_hip_mfma_dense or _fused_rot_quant_gluon is not None:
-    from vllm.utils.torch_utils import direct_register_custom_op
-
-    # Pre-allocated static buffers to eliminate per-call GPU allocations.
-    # Key: (M, K, device_index) → (fp4_buf, sc_buf)
-    # CUDAGraph-safe: same buffer address across captures and replays.
-    _rot_quant_buf_cache: dict = {}
-
-    def _get_rot_quant_bufs(
-        M: int, K: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return pre-allocated (fp4, sc) buffers, creating them on first call."""
-        key = (M, K, device.index if device.index is not None else 0)
-        if key not in _rot_quant_buf_cache:
-            n_sc = K // 32
-            sn_padded = (n_sc + 7) // 8 * 8
-            sm_padded = (M + 255) // 256 * 256
-            fp4 = torch.empty((M, K // 2), dtype=torch.uint8, device=device)
-            # sc is always zero-initialized once; kernel writes all live cells.
-            sc = torch.zeros((sm_padded, sn_padded), dtype=torch.uint8, device=device)
-            _rot_quant_buf_cache[key] = (fp4, sc)
-        return _rot_quant_buf_cache[key]
-
-    def _fused_rot_quant_op(
-        x: torch.Tensor,
-        rotation: torch.Tensor,
-        rotation_size: int = 128,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x_2d = x.reshape(-1, x.shape[-1])
-        M, K = x_2d.shape
-
-        if _use_hip_mfma_dense:
-            shuffle = M >= 32
-            fp4, sc = _get_rot_quant_bufs(M, K, x.device)
-            # sc padding cells stay zero from one-time initialization.
-            # No sc.zero_() needed on every call — the kernel only writes
-            # live cells and the GEMM downstream reads only those cells.
-            _hip_mfma_rot_quant_dense(
-                x_2d, rotation, fp4, sc, rotation_size, shuffle)
-        elif _fused_rot_quant_gluon is not None:
-            n_sc = K // 32
-            sn_padded = (n_sc + 7) // 8 * 8
-            sm_padded = (M + 255) // 256 * 256
-            fp4 = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
-            sc = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
-            if M < 32:
-                sc_raw = torch.empty(
-                    (M, n_sc), dtype=torch.uint8, device=x.device)
-                _fused_rot_quant_gluon(
-                    x_2d, rotation, rotation_size,
-                    fp4_out=fp4, scales_out=sc_raw, shuffle_scales=False)
-                sc[:M, :n_sc] = sc_raw
-            else:
-                sc.zero_()
-                _fused_rot_quant_gluon(
-                    x_2d, rotation, rotation_size,
-                    fp4_out=fp4, scales_out=sc, shuffle_scales=True)
-        return fp4, sc
-
-    def _fused_rot_quant_fake(
-        x: torch.Tensor,
-        rotation: torch.Tensor,
-        rotation_size: int = 128,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        M = x.reshape(-1, x.shape[-1]).shape[0]
-        K = x.shape[-1]
-        sn_padded = (K // 32 + 7) // 8 * 8
-        sm_padded = (M + 255) // 256 * 256
-        return (
-            torch.empty((M, K // 2), dtype=torch.uint8, device=x.device),
-            torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device),
-        )
-
-    direct_register_custom_op(
-        op_name="fused_rotation_mxfp4_quant",
-        op_func=_fused_rot_quant_op,
-        mutates_args=[],
-        fake_impl=_fused_rot_quant_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-
-    def _fused_rot_quant(x, rotation, rotation_size=128, **kwargs):
-        return torch.ops.vllm.fused_rotation_mxfp4_quant(x, rotation, rotation_size)
-
-    _has_fused_triton_rot_quant = True
-    _have_hip = _use_hip_mfma_dense
-    _have_glu = _fused_rot_quant_gluon is not None
-    # Dispatch policy: Gluon Triton is optimal for ALL M values based on
-    # real E2E shape benchmarks on MI355X (K=2048/7168, M=1..1024).
-    # HIP MFMA fallback when Gluon unavailable.
-    # Use VLLM_HIP_FUSED_MAX_M=N to force HIP for M<N (default 0 = Gluon always).
-    _hip_max = int(os.environ.get("VLLM_HIP_FUSED_MAX_M", "0"))
-    if _have_glu and _hip_max == 0:
-        _backend = "Gluon Triton (optimal for all M, 20-105% faster than Separated)"
-    elif _have_hip and _have_glu:
-        _backend = f"Hybrid HIP MFMA (M<{_hip_max}) + Gluon Triton (M≥{_hip_max})"
-    elif _have_hip:
-        _backend = "HIP MFMA only (Gluon unavailable)"
-    else:
-        _backend = "Gluon Triton only"
-    print(f"[INFO] Registered fused_rotation_mxfp4_quant custom op ({_backend})")
+_has_fused_triton_rot_quant = _use_hip_mfma_dense or _fused_rot_quant_gluon is not None
 
 logger = init_logger(__name__)
 
 
-
-# TODO: move registration of custom op to aiter_ops.py
-# `from vllm._aiter_ops import rocm_aiter_ops`
-# use `rocm_aiter_ops.is_asm_fp4_gemm_dynamic_quant_enabled()`
-# for envs checks which does not require @cache anymore.
-# triton kernel is torch compile compatible.
-# does not require direct registration.
-# use `rocm_aiter_ops.triton_fp4_gemm_dynamic_qaunt`.
 @cache
 def is_rocm_aiter_fp4_asm_gemm_enabled() -> bool:
     return (
@@ -269,29 +159,12 @@ try:
         _gemm_rot_quant_buf_cache[key] = (fp4_buf, sc_buf)
         return fp4_buf, sc_buf
 
-    # ------------------------------------------------------------------
-    # Dispatch policy for dense rotation+quant: HIP MFMA vs Gluon Triton.
-    #
-    # Real E2E shape benchmark (MI355X, CUDAGraph mode, Qwen3-30B-A3B):
-    #   K=2048 (attention):
-    #     M=1  HIP 4.60µs / Gluon 4.79µs → within 5% (Gluon preferred)
-    #     M≥2  Gluon 4.85-7.3µs vs HIP 5.2-8.2µs → Gluon 7-42% faster
-    #   K=7168 (MoE expert):
-    #     M=1  HIP 4.73µs / Gluon 4.88µs → within 5% (Gluon preferred)
-    #     M≥2  Gluon 4.93-16.3µs vs HIP 5.3-18.3µs → Gluon 7-31% faster
-    #
-    # Conclusion: Gluon Triton is optimal for ALL M values (HIP never
-    # clearly dominates by >5% margin across real production shapes).
-    # Speedup vs Separated (matmul+quant): Gluon 20-105% faster.
-    #
-    # Strategy: always use Gluon Triton when available.
-    # Default HIP_FUSED_MAX_M=0 means Gluon for all M.
-    # Override via env: VLLM_HIP_FUSED_MAX_M (set to 9999 to always use HIP,
-    #                                          any value N → HIP if M < N).
-    # ------------------------------------------------------------------
+    # Dispatch: Gluon Triton is optimal for all M (20-105% faster than Separated,
+    # MI355X benchmark). HIP MFMA within 5% at M=1 only; Gluon 7-42% faster M≥2.
+    # VLLM_HIP_FUSED_MAX_M=N forces HIP for M<N (default 0 = always Gluon).
     HIP_FUSED_MAX_M = int(os.environ.get("VLLM_HIP_FUSED_MAX_M", "0"))
-    _has_hip_mfma  = _use_hip_mfma_dense and (_hip_mfma_rot_quant_dense is not None)
-    _has_gluon     = _fused_rot_quant_gluon is not None
+    _has_hip_mfma = _use_hip_mfma_dense and (_hip_mfma_rot_quant_dense is not None)
+    _has_gluon = _fused_rot_quant_gluon is not None
 
     def gemm_with_dynamic_quant(
         x: torch.Tensor,
@@ -306,11 +179,6 @@ try:
         M = x.shape[0]
         N = weight.shape[0]
         K = weight.shape[1]
-        # Fused rotation+quant dispatch (real E2E benchmark on MI355X):
-        # Gluon Triton is optimal for ALL M (20-105% faster than Separated).
-        # HIP MFMA is within 5% of Gluon at M=1 only; Gluon 7-42% faster for M≥2.
-        # Default: always Gluon (HIP_FUSED_MAX_M=0). Set VLLM_HIP_FUSED_MAX_M=N
-        # to use HIP for M<N (e.g., =2 for M=1 decode only, =9999 for always HIP).
         if rotation is not None and rotation_size > 0 and _has_fused_triton_rot_quant:
             x_2d = x.reshape(-1, x.shape[-1])
             K_in = x.shape[-1]

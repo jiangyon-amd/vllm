@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 """
-Fused Rotation + MXFP4 Quant — Gluon
+Fused Rotation + MXFP4 Quant — Gluon Triton kernel.
 
 Single kernel: rotation matmul (MFMA) + MXFP4 quantization + scale shuffle.
-For dense models (Qwen3-8B/14B/32B). MoE paths are in separate files.
+For dense attention/MLP layers (Qwen3-8B/14B/32B).
+MoE rotation paths live in separate files (gluon_rotation_only_v2/v3).
 """
 
 import torch
@@ -16,11 +16,10 @@ if not (hasattr(gl, 'amd') and hasattr(gl.amd, 'cdna4')):
     raise ImportError("Gluon cdna4 not available (requires Triton 3.5.x)")
 
 # Layout / padding constants (must match quark_ocp_mx / OCP MXFP4)
-QGROUP = 32
+QGROUP = 32            # MXFP4 quantization group size
 FP4_ELEMS_PER_BYTE = 2
-SCALE_COL_ALIGN = 8
-SCALE_ROW_TILE = 256
-ROW_ALIGN = 32
+SCALE_COL_ALIGN = 8    # scale column padding (AMD GEMM requirement)
+SCALE_ROW_TILE = 256   # scale row padding (aiter prefetch tile)
 BLOCK_M = 32
 NUM_WARPS = 4
 
@@ -37,8 +36,6 @@ def _fused_rot_quant_gluon(
     NUM_WARPS: gl.constexpr,
     SHUFFLE_SCALES: gl.constexpr,
 ):
-    # Kernel literals: 2=fp4 elems per byte, 23=float32 exp bit, 31=ROW_ALIGN-1,
-    # 32=QG/BLOCK_M, 256/64/4/16=shuffle layout (scale tile 8 col, 32 row).
     pid_m   = gl.program_id(0)
     pid_rot = gl.program_id(1)
 
@@ -70,12 +67,12 @@ def _fused_rot_quant_gluon(
     offs_m = m_base + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
     m_mask = offs_m < M
 
-    # ======== Load x [BLOCK_M, RS] via buffer_load ========
+    # ======== Load x [BLOCK_M, RS] ========
     offs_k = gl.arange(0, RS, layout=gl.SliceLayout(0, blocked_mk))
     x_offs = offs_m[:, None] * stride_x_m + (col_base + offs_k)[None, :]
     x_tile = gl.amd.cdna4.buffer_load(ptr=x_ptr, offsets=x_offs, mask=m_mask[:, None])
 
-    # ======== Load rotation [RS, RS] to shared memory ========
+    # ======== Load rotation [RS, RS] → shared memory ========
     smem_rot = gl.allocate_shared_memory(gl.bfloat16, [RS, RS], layout=shared_rot)
     offs_rr = gl.arange(0, RS, layout=gl.SliceLayout(1, blocked_kn))
     offs_rc = gl.arange(0, RS, layout=gl.SliceLayout(0, blocked_kn))
@@ -83,13 +80,13 @@ def _fused_rot_quant_gluon(
         offsets=offs_rr[:, None] * stride_rot_r + offs_rc[None, :] * stride_rot_c)
     smem_rot.store(rot_data)
 
-    # ======== MFMA rotation matmul (single pass, no K accumulation) ========
+    # ======== MFMA rotation matmul ========
     acc = gl.zeros((BLOCK_M, RS), gl.float32, layout=mfma_layout)
     acc = gl.amd.cdna4.mfma(gl.convert_layout(x_tile, dot_a),
                              smem_rot.load(layout=dot_b), acc)
     acc = acc.to(gl.bfloat16).to(gl.float32)
 
-    # ======== Quantization in MFMA layout ========
+    # ======== MXFP4 Quantization ========
     acc_g = gl.reshape(acc, (BLOCK_M, NUM_QG, QG))
     amax = gl.max(gl.abs(acc_g), axis=-1)
 
@@ -122,7 +119,7 @@ def _fused_rot_quant_gluon(
     packed = packed_u32.to(gl.uint8)
     packed = gl.reshape(packed, (BLOCK_M, RS // 2))
 
-    # ======== Store FP4 via buffer_store ========
+    # ======== Store FP4 ========
     fp4_store: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 4], threads_per_warp=[2, 32],
         warps_per_cta=[NUM_WARPS, 1], order=[1, 0],
@@ -140,20 +137,18 @@ def _fused_rot_quant_gluon(
         size_per_thread=[1, 1], threads_per_warp=[32, 2],
         warps_per_cta=[NUM_WARPS, 1], order=[1, 0],
     )
-    shared_sc: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0],
-    )
     sc_m_idx = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, sc_store2))
     sc_q_idx = gl.arange(0, NUM_QG, layout=gl.SliceLayout(0, sc_store2))
     sc_mask = (m_base + sc_m_idx[:, None]) < M
     sc_base = pid_rot * NUM_QG
 
     if SHUFFLE_SCALES:
-        # LDS round-trip for scale layout conversion (a4w4 GEMM scale-pipeline
-        # pattern: LW -> LR). The register-side gl.convert_layout drops the rep
-        # elements for NUM_QG>2, but reading back from LDS recovers the full
-        # layout, so we avoid the previous two-phase GLOBAL temp round-trip and
-        # keep only the single scatter store to the AMD-shuffled positions.
+        # LDS round-trip recovers all scale elements dropped by register-side
+        # convert_layout (rep columns lost for NUM_QG>2), avoiding the previous
+        # two-phase global-memory round-trip. 1.05-1.12x kernel speedup.
+        shared_sc: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0],
+        )
         smem_sc = gl.allocate_shared_memory(gl.uint8, [BLOCK_M, NUM_QG], layout=shared_sc)
         smem_sc.store(e8m0_u8)
         sc_redist = smem_sc.load(sc_store2)
@@ -174,12 +169,29 @@ def _fused_rot_quant_gluon(
 
 
 def fused_rot_quant_gluon(
-    x, rotation, rotation_size=128,
-    fp4_out=None, scales_out=None, shuffle_scales=False,
-    # MoE params (ignored, kept for API compatibility)
-    sorted_scales=False, sorted_scales_topk8=False,
-    sorted_ids=None, num_valid_ids=None, token_num=0,
-):
+    x: torch.Tensor,
+    rotation: torch.Tensor,
+    rotation_size: int = 128,
+    fp4_out: torch.Tensor | None = None,
+    scales_out: torch.Tensor | None = None,
+    shuffle_scales: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused rotation + MXFP4 quantization (Dense Gluon kernel).
+
+    Args:
+        x: Input tensor [M, K], bfloat16.
+        rotation: Orthogonal rotation matrix [rotation_size, rotation_size].
+        rotation_size: Block size for blockwise rotation (RS). K must be divisible by RS.
+        fp4_out: Optional pre-allocated FP4 output buffer [M, K//2], uint8.
+        scales_out: Optional pre-allocated scale buffer. Shape depends on shuffle_scales:
+            shuffle_scales=False → [M, K//32]
+            shuffle_scales=True  → [ceil(M/256)*256, ceil(K//32/8)*8]  (AMD GEMM layout)
+        shuffle_scales: If True, output scales in AMD a4w4 GEMM pre-shuffled layout
+            (required for tuned preshuffled GEMM path; decode M<32 uses False).
+
+    Returns:
+        (fp4_out, scales_out) tensors.
+    """
     assert x.ndim == 2
     M, K = x.shape
     assert K % rotation_size == 0
@@ -190,14 +202,11 @@ def fused_rot_quant_gluon(
         fp4_out = torch.empty((M, K // FP4_ELEMS_PER_BYTE), dtype=torch.uint8, device=x.device)
 
     if shuffle_scales:
-        # LDS round-trip needs no global temp rows: sm_padded (256-aligned) is
-        # exactly enough and matches the dispatch's pre-allocated buffer, so no
-        # per-call reallocation (CUDAGraph-safe).
+        # sm_padded × sn_padded: AMD GEMM scale layout, 256-row aligned.
+        # No extra temp rows needed (LDS round-trip handles layout conversion).
         sn_padded = (n_scales + SCALE_COL_ALIGN - 1) // SCALE_COL_ALIGN * SCALE_COL_ALIGN
         sm_padded = (M + SCALE_ROW_TILE - 1) // SCALE_ROW_TILE * SCALE_ROW_TILE
-        if scales_out is None:
-            scales_out = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
-        elif scales_out.shape[0] < sm_padded:
+        if scales_out is None or scales_out.shape[0] < sm_padded:
             scales_out = torch.empty((sm_padded, sn_padded), dtype=torch.uint8, device=x.device)
     else:
         sn_padded = n_scales
