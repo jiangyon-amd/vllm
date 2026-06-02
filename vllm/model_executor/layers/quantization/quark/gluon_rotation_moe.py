@@ -6,7 +6,7 @@ Single kernel parameterized by k_width (constexpr):
   k_width=8  → used for M>=4 (V3 behaviour, better throughput via wider dot)
 
 Dispatch (called from fused_moe_rotation.py):
-  gluon_moe_rotation(x, rotation, rotation_size, M)
+  gluon_moe_rotation(x, rotation, rotation_size)
 """
 
 import torch

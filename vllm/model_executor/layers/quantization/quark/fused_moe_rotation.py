@@ -4,7 +4,6 @@ MoE rotation feature flags and Gluon kernel activation.
 Environment variables:
   VLLM_FUSED_ROTATION=1            → enable both Dense Gluon + MoE Gluon (recommended)
   VLLM_FUSED_ROTATION=0            → disable both
-  VLLM_MOE_FUSED_ROTATION=0        → disable MoE fused rotation entirely
   VLLM_MOE_FORCE_GLUON_ROTATION=1  → enable MoE Gluon only (legacy)
 """
 
@@ -13,9 +12,6 @@ import os
 import torch
 
 logger = logging.getLogger(__name__)
-
-# Whether MoE fused rotation pipeline is active.
-FUSED_MOE_ROTATION: bool = os.getenv("VLLM_MOE_FUSED_ROTATION", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # MoE Gluon monkey-patch: replaces torch.matmul rotation in aiter's
@@ -54,7 +50,8 @@ def _apply_gluon_rotation_patch() -> None:
     logger.info("Applied Gluon rotation patch to aiter.fused_moe_2stages")
 
 
-def _is_moe_gluon_rotation_enabled() -> bool:
+def _is_moe_rotation_enabled() -> bool:
+    """True when MoE Gluon rotation is requested via env vars."""
     unified = os.environ.get("VLLM_FUSED_ROTATION", "").strip().lower()
     if unified in ("1", "true"):
         return True
@@ -63,16 +60,21 @@ def _is_moe_gluon_rotation_enabled() -> bool:
     return os.getenv("VLLM_MOE_FORCE_GLUON_ROTATION", "0") == "1"
 
 
-if _is_moe_gluon_rotation_enabled():
+# Apply patch eagerly at import time if enabled.
+if _is_moe_rotation_enabled():
     try:
         _apply_gluon_rotation_patch()
     except Exception as e:
         logger.warning("Failed to apply MoE Gluon rotation patch: %s", e)
 
-# _has_moe_rot_quant: True when aiter supports MoE fused rotation
-# (rocm_aiter_ops.fused_moe accepts rotation/rotation_size kwargs).
+# True when aiter supports passing rotation through fused_moe_2stages.
 try:
     from vllm._aiter_ops import rocm_aiter_ops as _aiter_ops
-    _has_moe_rot_quant = hasattr(_aiter_ops, 'fused_moe')
+    _has_moe_rot_quant: bool = (
+        _is_moe_rotation_enabled() and hasattr(_aiter_ops, 'fused_moe')
+    )
 except Exception:
     _has_moe_rot_quant = False
+
+# Keep FUSED_MOE_ROTATION as alias for backward compat with qwen3_moe.py import
+FUSED_MOE_ROTATION = _has_moe_rot_quant

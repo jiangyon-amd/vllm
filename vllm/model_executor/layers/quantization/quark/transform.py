@@ -67,20 +67,7 @@ class OrthogonalTransform(torch.nn.Module):
         ):
             rotation_config = quant_config["algo_config"][0]
 
-            online_config = rotation_config.get("online_config") or {}
-            online_rotation_layers = online_config.get("online_rotation_layers")
-
-            # Quark 0.11 Hadamard format: online_config is null, infer from
-            # online_r1_rotation flag and scaling_layers structure.
-            if not online_rotation_layers and rotation_config.get("online_r1_rotation"):
-                scaling = rotation_config.get("scaling_layers", {})
-                online_rotation_layers = set()
-                for group in ("first_layer", "middle_layers", "last_layer"):
-                    for entry in scaling.get(group, []):
-                        for mod in entry.get("next_modules", []):
-                            base = mod.replace("model.layers.layer_id.", "").replace("model.layers.pre_layer_id.", "")
-                            online_rotation_layers.add(base)
-                online_rotation_layers = list(online_rotation_layers) if online_rotation_layers else None
+            online_rotation_layers = get_online_rotation_layers(rotation_config) or None
 
             if online_rotation_layers is not None and any(
                 any(ol in layer_name for ol in online_rotation_layers) for layer_name in layer_names
@@ -106,6 +93,35 @@ class OrthogonalTransform(torch.nn.Module):
 
         logger.debug("self.rotation_size: %s", self.rotation_size)
         logger.debug("self.input_rotation.data: %s", self.input_rotation.data)
+
+
+def get_online_rotation_layers(rotation_config: dict) -> list[str]:
+    """Extract the list of online-rotation layer names from a rotation config dict.
+
+    Supports two Quark formats:
+      - New (≥0.12): online_config.online_rotation_layers  (explicit list)
+      - Legacy (0.11 Hadamard): online_r1_rotation=True + scaling_layers  (inferred)
+
+    Returns an empty list if online rotation is not configured.
+    """
+    online_cfg = rotation_config.get("online_config") or {}
+    layers = online_cfg.get("online_rotation_layers")
+    if layers:
+        return list(layers)
+
+    if rotation_config.get("online_r1_rotation"):
+        scaling = rotation_config.get("scaling_layers", {})
+        names: set[str] = set()
+        for group in ("first_layer", "middle_layers", "last_layer"):
+            for entry in scaling.get(group, []):
+                for mod in entry.get("next_modules", []):
+                    base = (mod
+                            .replace("model.layers.layer_id.", "")
+                            .replace("model.layers.pre_layer_id.", ""))
+                    names.add(base)
+        return list(names)
+
+    return []
 
 
 def rotation_weight_loader(

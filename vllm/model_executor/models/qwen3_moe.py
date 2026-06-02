@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 try:
     from vllm.model_executor.layers.quantization.quark.transform import (
         OrthogonalTransform,
+        get_online_rotation_layers,
         rotation_weight_loader,
     )
     from vllm.model_executor.parameter import ModelWeightParameter
@@ -206,19 +207,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             return
 
         rot_cfg = algo_list[0]
-        online_cfg = rot_cfg.get('online_config') or {}
-        online_layers = online_cfg.get('online_rotation_layers')
-
-        if not online_layers and rot_cfg.get('online_r1_rotation'):
-            scaling = rot_cfg.get('scaling_layers', {})
-            online_layers_set = set()
-            for group in ('first_layer', 'middle_layers', 'last_layer'):
-                for entry in scaling.get(group, []):
-                    for mod in entry.get('next_modules', []):
-                        base = mod.replace('model.layers.layer_id.', '').replace('model.layers.pre_layer_id.', '')
-                        online_layers_set.add(base)
-            online_layers = list(online_layers_set) if online_layers_set else []
-
+        online_layers = get_online_rotation_layers(rot_cfg)
         if not online_layers:
             return
 
