@@ -170,3 +170,41 @@ separated PPL=9.79
 | `vllm/model_executor/layers/quantization/quark/fused_moe_rotation.py` | MoE feature flags and monkey-patch |
 | `vllm/model_executor/layers/quantization/quark/transform.py` | `get_online_rotation_layers()` helper |
 | `vllm/model_executor/models/qwen3_moe.py` | Qwen3 MoE model with rotation support |
+
+---
+
+## 6. Benchmark 方法论说明
+
+### ⚠️ 两种 benchmark 模式不可混用
+
+| 模式 | 参数 | 含义 | 适用场景 |
+|---|---|---|---|
+| 并发模式 | `--max-concurrency N` | 最多 N 个请求同时在飞 | 测峰值吞吐、解码延迟 |
+| 速率模式 | `--request-rate N` | 每秒发 N 个新请求 | 测特定负载下的稳态延迟 |
+
+**同一 N 值下两种模式的 TPOT 数字不可直接对比**（含义不同，数量级可能相差 2-3x）。
+
+### 统一标准（本项目后续）
+
+使用 `--max-concurrency`，配合足够的样本量：
+
+```bash
+vllm bench serve \
+    --backend openai \
+    --base-url http://localhost:PORT \
+    --model MODEL_PATH \
+    --tokenizer MODEL_PATH \
+    --dataset-name random \
+    --random-input-len 1024 \
+    --random-output-len 1024 \
+    --num-prompts 200 \      # ≥200，避免 20-prompt 噪声
+    --num-warmups 20 \
+    --max-concurrency 16     # 或 32
+```
+
+### 历史基线说明
+
+`bench_32b_3way_run.log` / `bench_8b_3way_run.log` / `bench_14b_3way_run.log` 等历史日志
+使用的是 `--request-rate N`（旧方式），**与上述标准不可混用**，不应作为 regression 对比基准。
+
+可信对比基准：`bench_results/4model_sanity_*/`（2026-06-03，200 prompts, max-concurrency）。
